@@ -37,7 +37,7 @@ package-level `GetAs` is the temporary typed-get API:
 ```go
 type Profile struct { Name string `json:"name"` }
 
-_ = client.SetValue(ctx, "profile:1", Profile{Name: "Aki"}, time.Minute)
+_ = client.SetValue(ctx, "profile:1", Profile{Name: "Aki"}, memcache.ExpiresIn(time.Minute))
 profile, err := memcache.GetAs[Profile](ctx, client, "profile:1")
 ```
 
@@ -56,3 +56,10 @@ prepend could otherwise apply the mutation twice.
 Multiple servers use stable rendezvous hashing by default. `WithRouter` can
 replace it. Each server has an elastic concurrent connection pool: `maxIdle`
 limits retained idle connections, not active requests.
+
+```go
+client, err := memcache.NewServers([]string{
+    "cache-a:11211",
+    "cache-b:11211",
+})
+```

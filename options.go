@@ -8,11 +8,7 @@ import (
 	"time"
 )
 
-// Context is an alias used by generic helper functions whose method-shaped
-// equivalent cannot yet be expressed in Go.
-type Context = context.Context
-
-// DialContextFunc opens a server connection.
+// DialContextFunc opens a server connection and must be safe for concurrent use.
 type DialContextFunc func(context.Context, string, string) (net.Conn, error)
 
 type config struct {
@@ -31,7 +27,7 @@ type config struct {
 type Option func(*config) error
 
 func defaultConfig(server string) config {
-	d := &net.Dialer{Timeout: time.Second}
+	d := &net.Dialer{}
 	return config{
 		servers:     []string{server},
 		network:     "tcp",
@@ -106,8 +102,9 @@ func WithDialer(dial DialContextFunc) Option {
 	}
 }
 
-// WithTimeout sets the per-I/O timeout. Context deadlines take precedence
-// when sooner. A zero duration disables this client-side timeout.
+// WithTimeout sets the total deadline for one command or one backend's batch
+// exchange. Context deadlines take precedence when sooner. A zero duration
+// disables this client-side timeout.
 func WithTimeout(timeout time.Duration) Option {
 	return func(c *config) error {
 		if timeout < 0 {

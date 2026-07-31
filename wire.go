@@ -25,6 +25,13 @@ type MetaCommand struct {
 	HasValue bool
 }
 
+// framedResponseError marks an error discovered only after the full response
+// frame was consumed. The operation outcome is therefore not ambiguous.
+type framedResponseError struct{ err error }
+
+func (e *framedResponseError) Error() string { return e.err.Error() }
+func (e *framedResponseError) Unwrap() error { return e.err }
+
 func encodeKey(key string) (string, bool, error) {
 	if key == "" {
 		return "", false, fmt.Errorf("memcache: key must not be empty")
@@ -67,6 +74,12 @@ func (m MetaCommand) marshal() ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("memcache: unsupported meta command %q", m.Command)
 	}
+	if m.Command == "ms" && !m.HasValue {
+		return nil, fmt.Errorf("memcache: ms requires HasValue")
+	}
+	if m.Command != "ms" && m.HasValue {
+		return nil, fmt.Errorf("memcache: %s does not accept a value", m.Command)
+	}
 	key, binary, err := encodeKey(m.Key)
 	if err != nil {
 		return nil, err
@@ -76,7 +89,16 @@ func (m MetaCommand) marshal() ([]byte, error) {
 		if m.Command == "me" {
 			return nil, fmt.Errorf("memcache: meta debug does not reliably support binary keys")
 		}
-		flags = append(flags, "b")
+		hasBase64 := false
+		for _, flag := range flags {
+			if flag == "b" {
+				hasBase64 = true
+				break
+			}
+		}
+		if !hasBase64 {
+			flags = append(flags, "b")
+		}
 	}
 	var b strings.Builder
 	b.Grow(len(key) + len(m.Value) + 64)
@@ -138,7 +160,7 @@ func readRawResponse(reader *bufio.Reader, maxItemSize int) (RawResponse, error)
 	if strings.HasPrefix(text, "SERVER_ERROR") {
 		return RawResponse{}, &ServerError{Kind: "SERVER_ERROR", Message: strings.TrimSpace(strings.TrimPrefix(text, "SERVER_ERROR"))}
 	}
-	parts := strings.Fields(text)
+	parts := asciiFields(line)
 	if len(parts) == 0 {
 		return RawResponse{}, &ProtocolError{Message: "empty response"}
 	}
@@ -157,6 +179,9 @@ func readRawResponse(reader *bufio.Reader, maxItemSize int) (RawResponse, error)
 		if maxItemSize > 0 && size > uint64(maxItemSize) {
 			return RawResponse{}, &ProtocolError{Message: "response value exceeds configured maximum"}
 		}
+		if size > uint64(int(^uint(0)>>1)) {
+			return RawResponse{}, &ProtocolError{Message: "response value is too large for this platform"}
+		}
 		result.Value = make([]byte, int(size))
 		if _, err = io.ReadFull(reader, result.Value); err != nil {
 			return RawResponse{}, err
@@ -169,11 +194,13 @@ func readRawResponse(reader *bufio.Reader, maxItemSize int) (RawResponse, error)
 			return RawResponse{}, &ProtocolError{Message: "value is not CRLF terminated"}
 		}
 		flagStart = 2
-	case ResponseHeader, ResponseMiss, ResponseNotStore, ResponseExists, ResponseNotFound, ResponseNoop:
+	case ResponseHeader, ResponseMiss, ResponseNotStored, ResponseExists, ResponseNotFound, ResponseNoop:
 	case ResponseDebug:
 		if len(parts) < 2 {
 			return RawResponse{}, &ProtocolError{Message: "ME response omitted key"}
 		}
+		result.Key = []byte(parts[1])
+		result.Flags = append([]string(nil), parts[1:]...)
 		result.Debug = make(map[string]string)
 		for _, field := range parts[2:] {
 			name, value, ok := strings.Cut(field, "=")
@@ -187,13 +214,39 @@ func readRawResponse(reader *bufio.Reader, maxItemSize int) (RawResponse, error)
 	}
 	result.Flags = append([]string(nil), parts[flagStart:]...)
 	if err := parseResponseFlags(&result); err != nil {
-		return RawResponse{}, err
+		result.parseErr = err
+		return result, &framedResponseError{err: err}
 	}
 	return result, nil
 }
 
+func asciiFields(line []byte) []string {
+	fields := make([]string, 0, 8)
+	for start := 0; start < len(line); {
+		for start < len(line) && line[start] == ' ' {
+			start++
+		}
+		if start == len(line) {
+			break
+		}
+		end := start
+		for end < len(line) && line[end] != ' ' {
+			end++
+		}
+		fields = append(fields, string(line[start:end]))
+		start = end
+	}
+	return fields
+}
+
 func parseResponseFlags(result *RawResponse) error {
 	base64Key := false
+	var firstError error
+	record := func(err error) {
+		if firstError == nil {
+			firstError = err
+		}
+	}
 	for _, flag := range result.Flags {
 		if flag == "" {
 			continue
@@ -210,37 +263,43 @@ func parseResponseFlags(result *RawResponse) error {
 		case 'c':
 			v, e := parseUint(64)
 			if e != nil {
-				return e
+				record(e)
+				continue
 			}
 			result.Metadata.CAS = ptr(v)
 		case 't':
 			v, e := strconv.ParseInt(token, 10, 64)
 			if e != nil {
-				return &ProtocolError{Message: "invalid t response flag"}
+				record(&ProtocolError{Message: "invalid t response flag"})
+				continue
 			}
 			result.Metadata.TTL = ptr(v)
 		case 's':
 			v, e := parseUint(64)
 			if e != nil {
-				return e
+				record(e)
+				continue
 			}
 			result.Metadata.Size = ptr(v)
 		case 'f':
 			v, e := parseUint(32)
 			if e != nil {
-				return e
+				record(e)
+				continue
 			}
 			n := uint32(v)
 			result.Metadata.ClientFlags = &n
 		case 'l':
 			v, e := parseUint(64)
 			if e != nil {
-				return e
+				record(e)
+				continue
 			}
 			result.Metadata.LastAccess = ptr(v)
 		case 'h':
 			if token != "0" && token != "1" {
-				return &ProtocolError{Message: "invalid h response flag"}
+				record(&ProtocolError{Message: "invalid h response flag"})
+				continue
 			}
 			v := token == "1"
 			result.Metadata.HitBefore = &v
@@ -261,9 +320,10 @@ func parseResponseFlags(result *RawResponse) error {
 	if base64Key && result.Key != nil {
 		decoded, err := base64.StdEncoding.DecodeString(string(result.Key))
 		if err != nil {
-			return &ProtocolError{Message: "invalid base64 response key"}
+			record(&ProtocolError{Message: "invalid base64 response key"})
+		} else {
+			result.Key = decoded
 		}
-		result.Key = decoded
 	}
-	return nil
+	return firstError
 }

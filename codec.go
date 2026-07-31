@@ -1,12 +1,14 @@
 package memcache
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 )
 
 // Codec converts application values to and from cached bytes. Flags is an
 // application-owned uint32 stored by memcached and returned with the value.
+// Implementations must be safe for concurrent use.
 type Codec interface {
 	Marshal(value any) (data []byte, flags uint32, err error)
 	Unmarshal(data []byte, flags uint32, destination any) error
@@ -31,7 +33,7 @@ func (c JSONCodec) Unmarshal(data []byte, flags uint32, destination any) error {
 // GetAs is the temporary generic counterpart to Client.GetInto.
 //
 // TODO: make this a generic Client method if Go adds generic methods.
-func GetAs[T any](ctx Context, client *Client, key string) (T, error) {
+func GetAs[T any](ctx context.Context, client *Client, key string) (T, error) {
 	var value T
 	err := client.GetInto(ctx, key, &value)
 	return value, err

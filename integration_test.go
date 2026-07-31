@@ -72,6 +72,13 @@ func TestIntegrationCoreAndMetadata(t *testing.T) {
 	if item.Status != GetHit || item.Metadata.CAS == nil || item.Metadata.Size == nil || *item.Metadata.Size != uint64(len(value)) {
 		t.Fatalf("bad metadata: %#v", item)
 	}
+	storedMeta, err := c.Store(ctx, "metadata", []byte("abc"), SetOptions{ReturnCAS: true, ReturnSize: true, ReturnKey: true, Opaque: "request-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedMeta.CAS == nil || storedMeta.Size == nil || *storedMeta.Size != 3 || string(storedMeta.ReturnedKey) != "metadata" || storedMeta.Opaque != "request-1" {
+		t.Fatalf("store response metadata: %#v", storedMeta)
+	}
 	added, err := c.Add(ctx, "binary key", []byte("other"), 0)
 	if err != nil || added {
 		t.Fatalf("add existing = %v, %v", added, err)
@@ -103,15 +110,19 @@ func TestIntegrationArithmeticLeaseStale(t *testing.T) {
 	if err != nil || value < 10 {
 		t.Fatalf("increment = %d, %v", value, err)
 	}
+	unchanged, err := c.Increment(ctx, "counter", 0)
+	if err != nil || unchanged != value {
+		t.Fatalf("zero delta changed counter: %d -> %d (%v)", value, unchanged, err)
+	}
 	leaseTTL := Expiration(30)
-	lease, err := c.GetWithOptions(ctx, "lease", GetOptions{VivifyTTL: &leaseTTL})
+	lease, err := c.GetWithOptions(ctx, "lease", GetOptions{VivifyTTL: &leaseTTL, MetadataOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if lease.Lease != LeaseGranted || lease.Metadata.CAS == nil {
 		t.Fatalf("lease not granted: %#v", lease)
 	}
-	fulfilled, err := c.Store(ctx, "lease", []byte("fresh"), SetOptions{TTL: ttl, CompareCAS: lease.Metadata.CAS})
+	fulfilled, err := c.FulfillLease(ctx, lease, []byte("fresh"), ttl)
 	if err != nil || !fulfilled.Applied() {
 		t.Fatalf("fulfill lease: %#v, %v", fulfilled, err)
 	}
@@ -122,6 +133,49 @@ func TestIntegrationArithmeticLeaseStale(t *testing.T) {
 	stale, err := c.GetWithOptions(ctx, "lease", GetOptions{})
 	if err != nil || stale.Status != GetHit || stale.ValueState != ValueStale {
 		t.Fatalf("stale get: %#v, %v", stale, err)
+	}
+	refresh := Expiration(120)
+	early, err := c.GetWithOptions(ctx, "lease", GetOptions{RefreshBefore: &refresh})
+	if err != nil || early.Status != GetHit || early.Lease == LeaseNone {
+		t.Fatalf("R-only early refresh: %#v, %v", early, err)
+	}
+}
+
+func TestIntegrationAppendPrepend(t *testing.T) {
+	c := integrationClient(t)
+	ctx := context.Background()
+	if err := c.Set(ctx, "concat", []byte("b"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := c.Append(ctx, "concat", []byte("c")); err != nil || !ok {
+		t.Fatalf("append = %v, %v", ok, err)
+	}
+	if ok, err := c.Prepend(ctx, "concat", []byte("a")); err != nil || !ok {
+		t.Fatalf("prepend = %v, %v", ok, err)
+	}
+	got, err := c.Get(ctx, "concat")
+	if err != nil || string(got) != "abc" {
+		t.Fatalf("get = %q, %v", got, err)
+	}
+}
+
+func TestIntegrationUnicodeWhitespaceKey(t *testing.T) {
+	c := integrationClient(t)
+	ctx := context.Background()
+	key := "a\u00a0b"
+	if err := c.Set(ctx, key, []byte("x"), 0); err != nil {
+		t.Fatal(err)
+	}
+	command, err := buildGet(key, GetOptions{ReturnKey: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := c.ExecuteMeta(ctx, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(response.Key) != key {
+		t.Fatalf("returned key %q, want %q", response.Key, key)
 	}
 }
 
@@ -141,8 +195,8 @@ func TestIntegrationBatchAndCodec(t *testing.T) {
 		t.Fatalf("typed get = %#v, %v", got, err)
 	}
 	results, err := c.Batch(ctx, []Operation{
-		SetOperation{Key: "a", Value: []byte("A")}, GetOperation{Key: "missing"},
-		GetOperation{Key: "a"}, DeleteOperation{Key: "a"}, DeleteOperation{Key: "not-there"},
+		&SetOperation{Key: "a", Value: []byte("A")}, &GetOperation{Key: "missing"},
+		&GetOperation{Key: "a"}, &DeleteOperation{Key: "a"}, DeleteOperation{Key: "not-there"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -176,6 +230,25 @@ func TestIntegrationBatchAndCodec(t *testing.T) {
 	}
 }
 
+func TestIntegrationCodecFlag(t *testing.T) {
+	address := startMemcached(t)
+	client, err := New(address, WithCodec(JSONCodec{Flag: 37}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	type value struct {
+		N int `json:"n"`
+	}
+	if err := client.SetValue(context.Background(), "flagged", value{N: 7}, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := GetAs[value](context.Background(), client, "flagged")
+	if err != nil || got.N != 7 {
+		t.Fatalf("got %#v, %v", got, err)
+	}
+}
+
 func TestIntegrationContextCancellation(t *testing.T) {
 	c := integrationClient(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -183,5 +256,40 @@ func TestIntegrationContextCancellation(t *testing.T) {
 	_, err := c.Get(ctx, "key")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+type testRouter struct{}
+
+func (testRouter) Pick(key string, servers []string) int {
+	if len(key) > 0 && key[0] == 'b' {
+		return 1
+	}
+	return 0
+}
+
+func TestIntegrationMultiServerPartialFailure(t *testing.T) {
+	good := startMemcached(t)
+	client, err := NewServers([]string{good, "127.0.0.1:1"}, WithRouter(testRouter{}), WithDialTimeout(100*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	results, err := client.Batch(context.Background(), []Operation{
+		SetOperation{Key: "apple", Value: []byte("ok")},
+		SetOperation{Key: "banana", Value: []byte("unreachable")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results[0].Err != nil || results[0].Mutation == nil || !results[0].Mutation.Applied() {
+		t.Fatalf("good shard: %#v", results[0])
+	}
+	if results[1].Err == nil || results[1].Ambiguous {
+		t.Fatalf("bad shard: %#v", results[1])
+	}
+	got, err := client.Get(context.Background(), "apple")
+	if err != nil || string(got) != "ok" {
+		t.Fatalf("routed read: %q, %v", got, err)
 	}
 }

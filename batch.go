@@ -23,6 +23,7 @@ const (
 	kindArithmetic
 )
 
+// GetOperation is a batch meta get.
 type GetOperation struct {
 	Key     string
 	Options GetOptions
@@ -34,6 +35,7 @@ func (o GetOperation) prepare() (MetaCommand, operationKind, error) {
 	return c, kindGet, e
 }
 
+// SetOperation is a batch meta set.
 type SetOperation struct {
 	Key     string
 	Value   []byte
@@ -46,6 +48,7 @@ func (o SetOperation) prepare() (MetaCommand, operationKind, error) {
 	return c, kindSet, e
 }
 
+// DeleteOperation is a batch meta delete.
 type DeleteOperation struct {
 	Key     string
 	Options DeleteOptions
@@ -57,6 +60,7 @@ func (o DeleteOperation) prepare() (MetaCommand, operationKind, error) {
 	return c, kindDelete, e
 }
 
+// ArithmeticOperation is a batch meta arithmetic command.
 type ArithmeticOperation struct {
 	Key     string
 	Options ArithmeticOptions
@@ -85,6 +89,7 @@ type preparedOperation struct {
 	op      Operation
 	command MetaCommand
 	start   int
+	end     int
 }
 
 type batchGroup struct {
@@ -99,6 +104,35 @@ type groupOutcome struct {
 	err       error
 }
 
+func normalizeOperation(operation Operation) (Operation, error) {
+	switch op := operation.(type) {
+	case GetOperation, SetOperation, DeleteOperation, ArithmeticOperation:
+		return operation, nil
+	case *GetOperation:
+		if op == nil {
+			return nil, fmt.Errorf("nil *GetOperation")
+		}
+		return *op, nil
+	case *SetOperation:
+		if op == nil {
+			return nil, fmt.Errorf("nil *SetOperation")
+		}
+		return *op, nil
+	case *DeleteOperation:
+		if op == nil {
+			return nil, fmt.Errorf("nil *DeleteOperation")
+		}
+		return *op, nil
+	case *ArithmeticOperation:
+		if op == nil {
+			return nil, fmt.Errorf("nil *ArithmeticOperation")
+		}
+		return *op, nil
+	default:
+		return nil, fmt.Errorf("unsupported operation %T", operation)
+	}
+}
+
 func quietCommand(item preparedOperation) MetaCommand {
 	command := item.command
 	command.Flags = make([]string, 0, len(item.command.Flags)+2)
@@ -108,20 +142,28 @@ func quietCommand(item preparedOperation) MetaCommand {
 		}
 	}
 	command.Flags = append(command.Flags, "O"+strconv.Itoa(item.index))
-	needsSuccess := item.kind == kindArithmetic
-	if item.kind == kindSet {
-		op := item.op.(SetOperation)
-		needsSuccess = op.Options.ReturnCAS || op.Options.ReturnKey || op.Options.ReturnSize
-	}
-	if item.kind == kindDelete {
-		op := item.op.(DeleteOperation)
-		needsSuccess = op.Options.ReturnKey
-	}
+	needsSuccess := successResponseRequired(item)
 	// For mg, q suppresses only misses; hits still carry the requested value.
 	if item.kind == kindGet || !needsSuccess {
 		command.Flags = append(command.Flags, "q")
 	}
 	return command
+}
+
+func successResponseRequired(item preparedOperation) bool {
+	switch item.kind {
+	case kindGet:
+		return item.op.(GetOperation).Options.VivifyTTL != nil
+	case kindArithmetic:
+		return true
+	case kindSet:
+		op := item.op.(SetOperation)
+		return op.Options.ReturnCAS || op.Options.ReturnKey || op.Options.ReturnSize
+	case kindDelete:
+		return item.op.(DeleteOperation).Options.ReturnKey
+	default:
+		return false
+	}
 }
 
 // Batch executes operations in pipelines grouped by backend and restores
@@ -138,12 +180,21 @@ func (c *Client) Batch(ctx context.Context, operations []Operation) ([]Operation
 		if operation == nil {
 			return nil, fmt.Errorf("memcache: batch operation %d is nil", index)
 		}
+		operation, err := normalizeOperation(operation)
+		if err != nil {
+			return nil, fmt.Errorf("memcache: batch operation %d: %w", index, err)
+		}
 		command, kind, err := operation.prepare()
 		if err != nil {
 			return nil, fmt.Errorf("memcache: batch operation %d: %w", index, err)
 		}
 		if command.HasValue && c.config.maxItemSize > 0 && len(command.Value) > c.config.maxItemSize {
 			return nil, fmt.Errorf("memcache: batch operation %d value exceeds configured maximum", index)
+		}
+		for _, flag := range command.Flags {
+			if len(flag) > 0 && flag[0] == 'O' {
+				return nil, fmt.Errorf("memcache: batch operation %d: Opaque is reserved by Batch", index)
+			}
 		}
 		server, err := c.server(operation.operationKey())
 		if err != nil {
@@ -176,6 +227,7 @@ func (c *Client) Batch(ctx context.Context, operations []Operation) ([]Operation
 				return nil, fmt.Errorf("memcache: batch operation %d: %w", group.items[i].index, err)
 			}
 			group.payload = append(group.payload, wire...)
+			group.items[i].end = len(group.payload)
 		}
 		group.payload = append(group.payload, "mn\r\n"...)
 		ordered = append(ordered, *group)
@@ -186,7 +238,7 @@ func (c *Client) Batch(ctx context.Context, operations []Operation) ([]Operation
 		wg.Add(1)
 		go func(group batchGroup) {
 			defer wg.Done()
-			responses, written, err := c.servers[group.server].exchange(ctx, group.payload, func(response RawResponse) bool { return response.Code == ResponseNoop })
+			responses, written, err := c.servers[group.server].pipeline(ctx, group.payload)
 			outcomes <- groupOutcome{group: group, responses: responses, written: written, err: err}
 		}(group)
 	}
@@ -200,6 +252,11 @@ func (c *Client) Batch(ctx context.Context, operations []Operation) ([]Operation
 
 func (c *Client) resolveGroup(output []OperationResult, outcome groupOutcome) {
 	byIndex := make(map[int]RawResponse)
+	badIndex := make(map[int]error)
+	expected := make(map[int]struct{}, len(outcome.group.items))
+	for _, item := range outcome.group.items {
+		expected[item.index] = struct{}{}
+	}
 	barrier := false
 	parseFailure := error(nil)
 	for _, response := range outcome.responses {
@@ -216,18 +273,49 @@ func (c *Client) resolveGroup(output []OperationResult, outcome groupOutcome) {
 			parseFailure = &ProtocolError{Message: "pipeline response has invalid opaque token"}
 			continue
 		}
+		if _, ok := expected[index]; !ok {
+			parseFailure = &ProtocolError{Message: "pipeline response has unexpected opaque token"}
+			continue
+		}
+		if _, duplicate := byIndex[index]; duplicate {
+			delete(byIndex, index)
+			badIndex[index] = &ProtocolError{Message: "pipeline response repeated opaque token"}
+			continue
+		}
+		if _, duplicate := badIndex[index]; duplicate {
+			continue
+		}
 		byIndex[index] = response
 	}
 	if outcome.err == nil && !barrier {
 		parseFailure = &ProtocolError{Message: "pipeline omitted no-op barrier"}
 	}
 	for _, item := range outcome.group.items {
+		if itemError := badIndex[item.index]; itemError != nil {
+			sideEffect := item.kind != kindGet || commandHasSideEffect(item.command)
+			ambiguous := sideEffect && outcome.written >= item.end
+			if ambiguous {
+				itemError = &AmbiguousWriteError{Operation: item.command.Command, Key: item.op.operationKey(), Cause: itemError}
+			}
+			output[item.index] = OperationResult{Err: itemError, Ambiguous: ambiguous}
+			continue
+		}
 		if response, ok := byIndex[item.index]; ok {
 			output[item.index] = parseBatchResponse(item, response)
 			continue
 		}
 		if barrier && parseFailure == nil {
-			output[item.index] = inferQuietResult(item)
+			if !successResponseRequired(item) {
+				output[item.index] = inferQuietResult(item)
+				continue
+			}
+			cause := &ProtocolError{Message: "pipeline omitted required response"}
+			ambiguous := (item.kind != kindGet || commandHasSideEffect(item.command)) && outcome.written >= item.end
+			if ambiguous {
+				output[item.index] = OperationResult{Err: &AmbiguousWriteError{Operation: item.command.Command, Key: item.op.operationKey(), Cause: cause}, Ambiguous: true}
+			} else {
+				output[item.index] = OperationResult{Err: cause}
+			}
 			continue
 		}
 		cause := outcome.err
@@ -237,8 +325,8 @@ func (c *Client) resolveGroup(output []OperationResult, outcome groupOutcome) {
 		if cause == nil {
 			cause = &ProtocolError{Message: "pipeline failed"}
 		}
-		sideEffect := item.kind != kindGet
-		ambiguous := sideEffect && outcome.written > item.start
+		sideEffect := item.kind != kindGet || commandHasSideEffect(item.command)
+		ambiguous := sideEffect && outcome.written >= item.end
 		if ambiguous {
 			cause = &AmbiguousWriteError{Operation: item.command.Command, Key: item.op.operationKey(), Cause: cause}
 		}
@@ -260,6 +348,10 @@ func inferQuietResult(item preparedOperation) OperationResult {
 }
 
 func parseBatchResponse(item preparedOperation, wire RawResponse) OperationResult {
+	if wire.parseErr != nil {
+		return OperationResult{Err: wire.parseErr}
+	}
+	wire.Opaque = "" // Batch's opaque token is internal correlation state.
 	switch item.kind {
 	case kindGet:
 		op := item.op.(GetOperation)
@@ -267,17 +359,17 @@ func parseBatchResponse(item preparedOperation, wire RawResponse) OperationResul
 		return OperationResult{Get: &r, Err: err}
 	case kindSet:
 		op := item.op.(SetOperation)
-		status, err := mutationStatus(wire.Code, op.Options.Mode)
-		r := MutationResult{Key: op.Key, Status: status, CAS: wire.Metadata.CAS}
+		status, err := storeStatus(wire.Code, op.Options.Mode)
+		r := MutationResult{Key: op.Key, Status: status, CAS: wire.Metadata.CAS, Size: wire.Metadata.Size, ReturnedKey: wire.Key}
 		return OperationResult{Mutation: &r, Err: err}
 	case kindDelete:
 		op := item.op.(DeleteOperation)
-		status, err := mutationStatus(wire.Code, ModeSet)
-		r := MutationResult{Key: op.Key, Status: status, CAS: wire.Metadata.CAS}
+		status, err := deleteStatus(wire.Code)
+		r := MutationResult{Key: op.Key, Status: status, CAS: wire.Metadata.CAS, Size: wire.Metadata.Size, ReturnedKey: wire.Key}
 		return OperationResult{Mutation: &r, Err: err}
 	case kindArithmetic:
 		op := item.op.(ArithmeticOperation)
-		r, err := semanticArithmetic(op.Key, wire)
+		r, err := semanticArithmetic(op.Key, op.Options, wire)
 		return OperationResult{Arithmetic: &r, Err: err}
 	default:
 		return OperationResult{Err: &ProtocolError{Message: "unknown batch operation"}}

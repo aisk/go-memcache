@@ -3,6 +3,7 @@ package memcache
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -18,6 +19,24 @@ func TestMetaCommandMarshalBinaryKey(t *testing.T) {
 	want := "ms YSBi 4 T30 b\r\nx\r\ny\r\n"
 	if string(got) != want {
 		t.Fatalf("wire:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestMetaCommandDoesNotDuplicateBase64Flag(t *testing.T) {
+	got, err := (MetaCommand{Command: "mg", Key: "a b", Flags: []string{"v", "b"}}).marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Count(got, []byte(" b")) != 1 {
+		t.Fatalf("duplicate base64 flag: %q", got)
+	}
+}
+
+func TestASCIIFieldsPreserveUnicodeWhitespace(t *testing.T) {
+	got := asciiFields([]byte("VA 1 ka\xc2\xa0b"))
+	want := []string{"VA", "1", "ka\u00a0b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
 	}
 }
 
@@ -63,8 +82,8 @@ func TestBuildersValidateBeforeIO(t *testing.T) {
 		name string
 		err  error
 	}{
-		{"refresh without lease", func() error { _, e := buildGet("k", GetOptions{RefreshBefore: &ttl}); return e }()},
 		{"add with CAS", func() error { _, e := buildSet("k", nil, SetOptions{Mode: ModeAdd, CompareCAS: &cas}); return e }()},
+		{"invalidate without CAS", func() error { _, e := buildSet("k", nil, SetOptions{Invalidate: true}); return e }()},
 		{"append TTL", func() error { _, e := buildSet("k", nil, SetOptions{Mode: ModeAppend, TTL: 3}); return e }()},
 		{"stale TTL", func() error { _, e := buildDelete("k", DeleteOptions{StaleFor: &ttl}); return e }()},
 		{"initial pair", func() error { _, e := buildArithmetic("k", ArithmeticOptions{Initial: &cas}); return e }()},
@@ -76,11 +95,45 @@ func TestBuildersValidateBeforeIO(t *testing.T) {
 	}
 }
 
+func TestRawCommandShapeValidation(t *testing.T) {
+	if _, err := (MetaCommand{Command: "ms", Key: "key"}).marshal(); err == nil {
+		t.Fatal("ms without value was accepted")
+	}
+	if _, err := (MetaCommand{Command: "mg", Key: "key", HasValue: true}).marshal(); err == nil {
+		t.Fatal("mg with value was accepted")
+	}
+}
+
+func TestExecuteMetaRejectsQuietWithoutBarrier(t *testing.T) {
+	client, err := New("unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.ExecuteMeta(context.Background(), MetaCommand{Command: "mg", Key: "key", Flags: []string{"q"}})
+	if err == nil {
+		t.Fatal("quiet command was accepted")
+	}
+}
+
+func TestBatchRejectsTypedNilOperation(t *testing.T) {
+	client, err := New("unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var operation *GetOperation
+	if _, err := client.Batch(context.Background(), []Operation{operation}); err == nil {
+		t.Fatal("typed nil operation was accepted")
+	}
+}
+
 func TestExpirationHelpers(t *testing.T) {
 	if got := ExpiresIn(time.Nanosecond); got != 1 {
 		t.Fatalf("ExpiresIn: got %d", got)
 	}
 	if got := ExpiresIn(1500 * time.Millisecond); got != 2 {
 		t.Fatalf("ExpiresIn rounds up: got %d", got)
+	}
+	if got := ExpiresIn(31 * 24 * time.Hour); int64(got) < time.Now().Unix() {
+		t.Fatalf("long duration was not converted to absolute expiration: %d", got)
 	}
 }

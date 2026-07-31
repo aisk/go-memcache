@@ -32,14 +32,31 @@ func New(server string, options ...Option) (*Client, error) {
 	if len(cfg.servers) == 0 {
 		return nil, fmt.Errorf("memcache: at least one server is required")
 	}
+	seen := make(map[string]struct{}, len(cfg.servers))
 	client := &Client{config: cfg, servers: make([]*serverPool, len(cfg.servers))}
 	for i, address := range cfg.servers {
 		if address == "" {
 			return nil, fmt.Errorf("memcache: server address %d is empty", i)
 		}
+		if _, exists := seen[address]; exists {
+			return nil, fmt.Errorf("memcache: duplicate server address %q", address)
+		}
+		seen[address] = struct{}{}
 		client.servers[i] = &serverPool{address: address, config: &client.config}
 	}
 	return client, nil
+}
+
+// NewServers creates a client for one or more backends. It is the preferred
+// multi-server constructor; keys are routed with RendezvousRouter by default.
+func NewServers(servers []string, options ...Option) (*Client, error) {
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("memcache: at least one server is required")
+	}
+	all := make([]Option, 0, len(options)+1)
+	all = append(all, WithServers(servers...))
+	all = append(all, options...)
+	return New(servers[0], all...)
 }
 
 func (c *Client) server(key string) (*serverPool, error) {
@@ -63,12 +80,17 @@ func (c *Client) Close() error {
 
 // ExecuteMeta runs a raw command against the server selected by its key.
 func (c *Client) ExecuteMeta(ctx context.Context, command MetaCommand) (RawResponse, error) {
-	data, err := command.marshal()
-	if err != nil {
-		return RawResponse{}, err
+	for _, flag := range command.Flags {
+		if flag == "q" {
+			return RawResponse{}, fmt.Errorf("memcache: quiet commands require Batch or an explicit mn barrier")
+		}
 	}
 	if command.HasValue && c.config.maxItemSize > 0 && len(command.Value) > c.config.maxItemSize {
 		return RawResponse{}, fmt.Errorf("memcache: value exceeds configured maximum of %d bytes", c.config.maxItemSize)
+	}
+	data, err := command.marshal()
+	if err != nil {
+		return RawResponse{}, err
 	}
 	server, err := c.server(command.Key)
 	if err != nil {
@@ -80,12 +102,31 @@ func (c *Client) ExecuteMeta(ctx context.Context, command MetaCommand) (RawRespo
 		if errors.As(err, &serverErr) {
 			return RawResponse{}, err
 		}
-		if written > 0 && command.Command != "mg" && command.Command != "me" {
+		var framed *framedResponseError
+		if errors.As(err, &framed) {
+			return RawResponse{}, framed.err
+		}
+		if written == len(data) && commandHasSideEffect(command) {
 			return RawResponse{}, &AmbiguousWriteError{Operation: command.Command, Key: command.Key, Cause: err}
 		}
 		return RawResponse{}, err
 	}
 	return responses[0], nil
+}
+
+func commandHasSideEffect(command MetaCommand) bool {
+	if command.Command != "mg" {
+		return command.Command != "me"
+	}
+	for _, flag := range command.Flags {
+		if flag != "" {
+			switch flag[0] {
+			case 'T', 'N', 'R', 'E':
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func appendOpaque(flags []string, opaque string) ([]string, error) {
@@ -103,11 +144,11 @@ func expirationFlag(prefix string, expiration *Expiration) string {
 }
 
 func buildGet(key string, options GetOptions) (MetaCommand, error) {
-	if options.RefreshBefore != nil && options.VivifyTTL == nil {
-		return MetaCommand{}, fmt.Errorf("memcache: RefreshBefore requires VivifyTTL")
-	}
 	if options.UnlessCAS != nil && options.MetadataOnly {
 		return MetaCommand{}, fmt.Errorf("memcache: UnlessCAS requires a value read")
+	}
+	if options.MetadataOnly && options.VivifyTTL != nil && options.RefreshBefore != nil {
+		return MetaCommand{}, fmt.Errorf("memcache: metadata-only refresh cannot distinguish a miss from an early recache hit")
 	}
 	for name, ttl := range map[string]*Expiration{"VivifyTTL": options.VivifyTTL, "RefreshBefore": options.RefreshBefore} {
 		if ttl != nil && *ttl <= 0 {
@@ -164,7 +205,7 @@ func buildGet(key string, options GetOptions) (MetaCommand, error) {
 
 // Get reads a value and maps a miss to ErrCacheMiss.
 func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
-	result, err := c.GetWithOptions(ctx, key, GetOptions{ReturnClientFlags: true})
+	result, err := c.GetWithOptions(ctx, key, GetOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -188,11 +229,14 @@ func (c *Client) GetWithOptions(ctx context.Context, key string, options GetOpti
 }
 
 func semanticGet(key string, options GetOptions, wire RawResponse) (GetResult, error) {
-	result := GetResult{Key: key, Metadata: wire.Metadata, ValueState: ValueFresh, Lease: LeaseNone}
+	result := GetResult{Key: key, Metadata: wire.Metadata, ValueState: ValueFresh, Lease: LeaseNone, ReturnedKey: wire.Key, Opaque: wire.Opaque}
 	switch wire.Code {
 	case ResponseMiss:
 		result.Status, result.ValueState = GetMiss, ValueMissing
 	case ResponseValue, ResponseHeader:
+		if wire.Code == ResponseHeader && !options.MetadataOnly && options.UnlessCAS == nil {
+			return GetResult{}, &ProtocolError{Message: "value-bearing get returned HD"}
+		}
 		result.Status = GetHit
 		if wire.Code == ResponseValue {
 			result.Value = wire.Value
@@ -209,7 +253,9 @@ func semanticGet(key string, options GetOptions, wire RawResponse) (GetResult, e
 		if wire.Busy {
 			result.Lease = LeaseBusy
 		}
-		if options.VivifyTTL != nil && wire.Code == ResponseValue && len(wire.Value) == 0 && (wire.Won || wire.Busy) && !wire.Stale {
+		placeholder := options.VivifyTTL != nil && (wire.Won || wire.Busy) && !wire.Stale &&
+			(options.RefreshBefore == nil || (wire.Code == ResponseValue && len(wire.Value) == 0))
+		if placeholder {
 			result.ValueState = ValueMissing
 			if wire.Won {
 				result.Status = GetMiss
@@ -259,6 +305,9 @@ func buildSet(key string, value []byte, options SetOptions) (MetaCommand, error)
 	}
 	if options.Mode == ModeAdd && options.CompareCAS != nil {
 		return MetaCommand{}, fmt.Errorf("memcache: add cannot compare CAS")
+	}
+	if options.Invalidate && options.CompareCAS == nil {
+		return MetaCommand{}, fmt.Errorf("memcache: Invalidate requires CompareCAS")
 	}
 	if options.VivifyTTL != nil && *options.VivifyTTL <= 0 {
 		return MetaCommand{}, fmt.Errorf("memcache: VivifyTTL must be positive")
@@ -317,25 +366,51 @@ func (c *Client) Store(ctx context.Context, key string, value []byte, options Se
 	if err != nil {
 		return MutationResult{}, err
 	}
-	status, err := mutationStatus(wire.Code, options.Mode)
-	return MutationResult{Key: key, Status: status, CAS: wire.Metadata.CAS}, err
+	status, err := storeStatus(wire.Code, options.Mode)
+	return MutationResult{Key: key, Status: status, CAS: wire.Metadata.CAS, Size: wire.Metadata.Size, ReturnedKey: wire.Key, Opaque: wire.Opaque}, err
 }
 
-func mutationStatus(code ResponseCode, mode StoreMode) (MutationStatus, error) {
+func storeStatus(code ResponseCode, mode StoreMode) (MutationStatus, error) {
 	switch code {
-	case ResponseHeader, ResponseValue:
+	case ResponseHeader:
 		return MutationApplied, nil
 	case ResponseExists:
 		return MutationCASMismatch, nil
 	case ResponseNotFound:
 		return MutationNotFound, nil
-	case ResponseNotStore:
+	case ResponseNotStored:
 		if mode == ModeAdd {
 			return MutationAlreadyExists, nil
 		}
 		return MutationNotFound, nil
 	default:
-		return MutationNotFound, &ProtocolError{Message: fmt.Sprintf("unexpected mutation response %q", code)}
+		return MutationUnknown, &ProtocolError{Message: fmt.Sprintf("unexpected mutation response %q", code)}
+	}
+}
+
+func deleteStatus(code ResponseCode) (MutationStatus, error) {
+	switch code {
+	case ResponseHeader:
+		return MutationApplied, nil
+	case ResponseExists:
+		return MutationCASMismatch, nil
+	case ResponseNotFound:
+		return MutationNotFound, nil
+	default:
+		return MutationUnknown, &ProtocolError{Message: fmt.Sprintf("unexpected delete response %q", code)}
+	}
+}
+
+func arithmeticStatus(code ResponseCode) (MutationStatus, error) {
+	switch code {
+	case ResponseHeader, ResponseValue:
+		return MutationApplied, nil
+	case ResponseExists:
+		return MutationCASMismatch, nil
+	case ResponseNotFound, ResponseNotStored:
+		return MutationNotFound, nil
+	default:
+		return MutationUnknown, &ProtocolError{Message: fmt.Sprintf("unexpected arithmetic response %q", code)}
 	}
 }
 
@@ -359,6 +434,18 @@ func (c *Client) Add(ctx context.Context, key string, value []byte, expiration E
 // Replace stores only when key exists.
 func (c *Client) Replace(ctx context.Context, key string, value []byte, expiration Expiration) (bool, error) {
 	r, err := c.Store(ctx, key, value, SetOptions{TTL: expiration, Mode: ModeReplace})
+	return err == nil && r.Applied(), err
+}
+
+// Append atomically appends raw bytes to an existing value.
+func (c *Client) Append(ctx context.Context, key string, value []byte) (bool, error) {
+	r, err := c.Store(ctx, key, value, SetOptions{Mode: ModeAppend})
+	return err == nil && r.Applied(), err
+}
+
+// Prepend atomically prepends raw bytes to an existing value.
+func (c *Client) Prepend(ctx context.Context, key string, value []byte) (bool, error) {
+	r, err := c.Store(ctx, key, value, SetOptions{Mode: ModePrepend})
 	return err == nil && r.Applied(), err
 }
 
@@ -402,6 +489,7 @@ func (c *Client) Delete(ctx context.Context, key string) (bool, error) {
 	return err == nil && r.Applied(), err
 }
 
+// DeleteWithOptions performs a configurable meta delete or stale invalidation.
 func (c *Client) DeleteWithOptions(ctx context.Context, key string, options DeleteOptions) (MutationResult, error) {
 	command, err := buildDelete(key, options)
 	if err != nil {
@@ -411,8 +499,24 @@ func (c *Client) DeleteWithOptions(ctx context.Context, key string, options Dele
 	if err != nil {
 		return MutationResult{}, err
 	}
-	status, err := mutationStatus(wire.Code, ModeSet)
-	return MutationResult{Key: key, Status: status, CAS: wire.Metadata.CAS}, err
+	status, err := deleteStatus(wire.Code)
+	return MutationResult{Key: key, Status: status, CAS: wire.Metadata.CAS, Size: wire.Metadata.Size, ReturnedKey: wire.Key, Opaque: wire.Opaque}, err
+}
+
+// Invalidate marks an existing value stale while retaining it for the given
+// duration. A missing key is reported as (false, nil).
+func (c *Client) Invalidate(ctx context.Context, key string, staleFor Expiration) (bool, error) {
+	r, err := c.DeleteWithOptions(ctx, key, DeleteOptions{Invalidate: true, StaleFor: &staleFor})
+	return err == nil && r.Applied(), err
+}
+
+// FulfillLease stores a refreshed value using the CAS token returned to a
+// lease winner. It rejects results that did not grant a lease.
+func (c *Client) FulfillLease(ctx context.Context, lease GetResult, value []byte, expiration Expiration) (MutationResult, error) {
+	if lease.Lease != LeaseGranted || lease.Metadata.CAS == nil {
+		return MutationResult{}, fmt.Errorf("memcache: only a lease winner with CAS may fulfill a lease")
+	}
+	return c.Store(ctx, lease.Key, value, SetOptions{TTL: expiration, CompareCAS: lease.Metadata.CAS})
 }
 
 func buildArithmetic(key string, options ArithmeticOptions) (MetaCommand, error) {
@@ -422,11 +526,7 @@ func buildArithmetic(key string, options ArithmeticOptions) (MetaCommand, error)
 	if options.InitialTTL != nil && *options.InitialTTL <= 0 {
 		return MetaCommand{}, fmt.Errorf("memcache: InitialTTL must be positive")
 	}
-	delta := options.Delta
-	if delta == 0 {
-		delta = 1
-	}
-	flags := []string{"D" + strconv.FormatUint(delta, 10)}
+	flags := []string{"D" + strconv.FormatUint(options.Delta, 10)}
 	if options.Decrement {
 		flags = append(flags, "MD")
 	}
@@ -459,6 +559,7 @@ func buildArithmetic(key string, options ArithmeticOptions) (MetaCommand, error)
 	return MetaCommand{Command: "ma", Key: key, Flags: flags}, err
 }
 
+// Arithmetic performs configurable unsigned 64-bit meta arithmetic.
 func (c *Client) Arithmetic(ctx context.Context, key string, options ArithmeticOptions) (ArithmeticResult, error) {
 	command, err := buildArithmetic(key, options)
 	if err != nil {
@@ -468,12 +569,20 @@ func (c *Client) Arithmetic(ctx context.Context, key string, options ArithmeticO
 	if err != nil {
 		return ArithmeticResult{}, err
 	}
-	return semanticArithmetic(key, wire)
+	return semanticArithmetic(key, options, wire)
 }
 
-func semanticArithmetic(key string, wire RawResponse) (ArithmeticResult, error) {
-	status, err := mutationStatus(wire.Code, ModeSet)
-	result := ArithmeticResult{Key: key, Status: status, Metadata: wire.Metadata}
+func semanticArithmetic(key string, options ArithmeticOptions, wire RawResponse) (ArithmeticResult, error) {
+	status, err := arithmeticStatus(wire.Code)
+	result := ArithmeticResult{Key: key, Status: status, Metadata: wire.Metadata, ReturnedKey: wire.Key, Opaque: wire.Opaque}
+	if err == nil && status == MutationApplied {
+		if options.MetadataOnly && wire.Code != ResponseHeader {
+			return ArithmeticResult{}, &ProtocolError{Message: "metadata-only arithmetic returned a value"}
+		}
+		if !options.MetadataOnly && wire.Code != ResponseValue {
+			return ArithmeticResult{}, &ProtocolError{Message: "value-bearing arithmetic returned HD"}
+		}
+	}
 	if wire.Code == ResponseValue {
 		value, parseErr := strconv.ParseUint(string(wire.Value), 10, 64)
 		if parseErr != nil {
@@ -484,6 +593,7 @@ func semanticArithmetic(key string, wire RawResponse) (ArithmeticResult, error) 
 	return result, err
 }
 
+// Increment adds delta to an existing unsigned decimal value.
 func (c *Client) Increment(ctx context.Context, key string, delta uint64) (uint64, error) {
 	r, err := c.Arithmetic(ctx, key, ArithmeticOptions{Delta: delta})
 	if err != nil {
@@ -495,6 +605,8 @@ func (c *Client) Increment(ctx context.Context, key string, delta uint64) (uint6
 	return r.Value, nil
 }
 
+// Decrement subtracts delta from an existing unsigned decimal value, flooring
+// the result at zero.
 func (c *Client) Decrement(ctx context.Context, key string, delta uint64) (uint64, error) {
 	r, err := c.Arithmetic(ctx, key, ArithmeticOptions{Delta: delta, Decrement: true})
 	if err != nil {
@@ -529,7 +641,7 @@ func (c *Client) Debug(ctx context.Context, key string) (map[string]string, erro
 
 // GetInto decodes a cached value using the configured Codec.
 func (c *Client) GetInto(ctx context.Context, key string, destination any) error {
-	result, err := c.GetWithOptions(ctx, key, GetOptions{})
+	result, err := c.GetWithOptions(ctx, key, GetOptions{ReturnClientFlags: true})
 	if err != nil {
 		return err
 	}

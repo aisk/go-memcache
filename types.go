@@ -2,8 +2,9 @@ package memcache
 
 import "time"
 
-// Expiration is sent using memcached's TTL rules. Durations at or below 30
-// days are relative; later times should be supplied with ExpiresAt.
+// Expiration is sent using memcached's TTL rules. ExpiresIn uses relative
+// seconds through 30 days and automatically converts longer durations to an
+// absolute timestamp; ExpiresAt can be used explicitly.
 type Expiration int64
 
 const (
@@ -14,8 +15,18 @@ const (
 // ExpiresIn converts a relative duration to whole seconds, rounding a
 // positive sub-second duration up to one second.
 func ExpiresIn(d time.Duration) Expiration {
-	if d <= 0 {
+	if d < 0 {
+		seconds := d / time.Second
+		if seconds == 0 {
+			seconds = -1
+		}
+		return Expiration(seconds)
+	}
+	if d == 0 {
 		return Expiration(d / time.Second)
+	}
+	if d > maxRelativeExpiration {
+		return ExpiresAt(time.Now().Add(d))
 	}
 	seconds := (d + time.Second - 1) / time.Second
 	return Expiration(seconds)
@@ -28,14 +39,14 @@ func ExpiresAt(t time.Time) Expiration { return Expiration(t.Unix()) }
 type ResponseCode string
 
 const (
-	ResponseHeader   ResponseCode = "HD"
-	ResponseValue    ResponseCode = "VA"
-	ResponseMiss     ResponseCode = "EN"
-	ResponseNotStore ResponseCode = "NS"
-	ResponseExists   ResponseCode = "EX"
-	ResponseNotFound ResponseCode = "NF"
-	ResponseNoop     ResponseCode = "MN"
-	ResponseDebug    ResponseCode = "ME"
+	ResponseHeader    ResponseCode = "HD"
+	ResponseValue     ResponseCode = "VA"
+	ResponseMiss      ResponseCode = "EN"
+	ResponseNotStored ResponseCode = "NS"
+	ResponseExists    ResponseCode = "EX"
+	ResponseNotFound  ResponseCode = "NF"
+	ResponseNoop      ResponseCode = "MN"
+	ResponseDebug     ResponseCode = "ME"
 )
 
 // Metadata contains values requested from a meta get/arithmetic response.
@@ -49,23 +60,28 @@ type Metadata struct {
 	HitBefore   *bool
 }
 
+// GetStatus describes whether and how a meta get resolved.
 type GetStatus uint8
 
 const (
-	GetHit GetStatus = iota
+	GetUnknown GetStatus = iota
+	GetHit
 	GetMiss
 	GetPending
 	GetUnchanged
 )
 
+// ValueState distinguishes fresh, stale, and lease-placeholder values.
 type ValueState uint8
 
 const (
-	ValueFresh ValueState = iota
+	ValueUnknown ValueState = iota
+	ValueFresh
 	ValueStale
 	ValueMissing
 )
 
+// LeaseState reports ownership of a vivify or early-refresh lease.
 type LeaseState uint8
 
 const (
@@ -77,20 +93,24 @@ const (
 // GetResult describes a meta get without collapsing protocol states into an
 // error. Value is present only for a value-bearing hit.
 type GetResult struct {
-	Key        string
-	Status     GetStatus
-	Value      []byte
-	Metadata   Metadata
-	ValueState ValueState
-	Lease      LeaseState
+	Key         string
+	Status      GetStatus
+	Value       []byte
+	Metadata    Metadata
+	ValueState  ValueState
+	Lease       LeaseState
+	ReturnedKey []byte
+	Opaque      string
 }
 
 func (r GetResult) Hit() bool { return r.Status == GetHit }
 
+// MutationStatus describes a conditional set, delete, or arithmetic outcome.
 type MutationStatus uint8
 
 const (
-	MutationApplied MutationStatus = iota
+	MutationUnknown MutationStatus = iota
+	MutationApplied
 	MutationNotFound
 	MutationAlreadyExists
 	MutationCASMismatch
@@ -98,20 +118,25 @@ const (
 
 // MutationResult describes a set or delete outcome.
 type MutationResult struct {
-	Key    string
-	Status MutationStatus
-	CAS    *uint64
+	Key         string
+	Status      MutationStatus
+	CAS         *uint64
+	Size        *uint64
+	ReturnedKey []byte
+	Opaque      string
 }
 
 func (r MutationResult) Applied() bool { return r.Status == MutationApplied }
 
 // ArithmeticResult describes an increment or decrement outcome.
 type ArithmeticResult struct {
-	Key      string
-	Status   MutationStatus
-	Value    uint64
-	HasValue bool
-	Metadata Metadata
+	Key         string
+	Status      MutationStatus
+	Value       uint64
+	HasValue    bool
+	Metadata    Metadata
+	ReturnedKey []byte
+	Opaque      string
 }
 
 // StoreMode selects meta set's M flag.
@@ -126,7 +151,11 @@ const (
 )
 
 // GetOptions exposes meta get behavior. Zero values perform a normal value
-// read. Set MetadataOnly for an explicit metadata-only operation.
+// read. Set MetadataOnly for an explicit metadata-only operation. When
+// VivifyTTL and RefreshBefore are combined, the wire protocol cannot
+// distinguish a real empty value won for early refresh from a newly vivified
+// empty placeholder. Value-bearing reads use the reference clients' empty
+// value heuristic; metadata-only reads reject that combination.
 type GetOptions struct {
 	MetadataOnly      bool
 	ReturnCAS         bool
@@ -199,6 +228,7 @@ type RawResponse struct {
 	Stale    bool
 	Flags    []string
 	Debug    map[string]string
+	parseErr error
 }
 
 func ptr[T any](value T) *T { return &value }

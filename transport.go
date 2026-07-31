@@ -3,6 +3,7 @@ package memcache
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -53,7 +54,10 @@ func (p *serverPool) acquire(ctx context.Context) (*pooledConn, error) {
 }
 
 func (p *serverPool) release(conn *pooledConn) {
-	_ = conn.SetDeadline(time.Time{})
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return
+	}
 	p.mu.Lock()
 	if !p.closed && len(p.idle) < p.config.maxIdle {
 		p.idle = append(p.idle, conn)
@@ -107,6 +111,19 @@ func writeAll(writer io.Writer, data []byte) (int, error) {
 	return written, nil
 }
 
+func interruptOnCancel(ctx context.Context, conn net.Conn) func() {
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(done)
+	})
+	return func() {
+		if !stop() {
+			<-done
+		}
+	}
+}
+
 // exchange executes one or more already-framed requests. stop decides when
 // the complete response stream has been received.
 func (p *serverPool) exchange(ctx context.Context, payload []byte, stop func(RawResponse) bool) (responses []RawResponse, written int, err error) {
@@ -130,8 +147,7 @@ func (p *serverPool) exchange(ctx context.Context, payload []byte, stop func(Raw
 			return nil, 0, err
 		}
 	}
-	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
-	defer stopCancel()
+	defer interruptOnCancel(ctx, conn)()
 	written, writeErr := writeAll(conn, payload)
 	if writeErr != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
@@ -143,6 +159,13 @@ func (p *serverPool) exchange(ctx context.Context, payload []byte, stop func(Raw
 		var response RawResponse
 		response, err = readRawResponse(conn.reader, p.config.maxItemSize)
 		if err != nil {
+			var framed *framedResponseError
+			if errors.As(err, &framed) {
+				responses = append(responses, response)
+				if stop(response) {
+					safe = true
+				}
+			}
 			if contextErr := ctx.Err(); contextErr != nil {
 				err = contextErr
 			}
@@ -154,4 +177,79 @@ func (p *serverPool) exchange(ctx context.Context, payload []byte, stop func(Raw
 			return responses, written, nil
 		}
 	}
+}
+
+type pipelineRead struct {
+	responses []RawResponse
+	barrier   bool
+	err       error
+}
+
+// pipeline writes and reads concurrently. This prevents a pipeline with
+// large value hits from deadlocking when both peers fill their send buffers.
+func (p *serverPool) pipeline(ctx context.Context, payload []byte) (responses []RawResponse, written int, err error) {
+	if err = ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	conn, err := p.acquire(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	safe := false
+	defer func() {
+		if safe {
+			p.release(conn)
+		} else {
+			p.discard(conn)
+		}
+	}()
+	if deadline, ok := operationDeadline(ctx, p.config.ioTimeout); ok {
+		if err = conn.SetDeadline(deadline); err != nil {
+			return nil, 0, err
+		}
+	}
+	defer interruptOnCancel(ctx, conn)()
+	readDone := make(chan pipelineRead, 1)
+	go func() {
+		var result pipelineRead
+		for {
+			response, readErr := readRawResponse(conn.reader, p.config.maxItemSize)
+			if readErr != nil {
+				var framed *framedResponseError
+				if errors.As(readErr, &framed) {
+					result.responses = append(result.responses, response)
+					continue
+				}
+				result.err = readErr
+				_ = conn.SetDeadline(time.Now()) // unblock a concurrent writer
+				readDone <- result
+				return
+			}
+			result.responses = append(result.responses, response)
+			if response.Code == ResponseNoop {
+				result.barrier = true
+				readDone <- result
+				return
+			}
+		}
+	}()
+	written, writeErr := writeAll(conn, payload)
+	if writeErr != nil {
+		_ = conn.SetDeadline(time.Now())
+	}
+	readResult := <-readDone
+	if contextErr := ctx.Err(); contextErr != nil {
+		return readResult.responses, written, contextErr
+	}
+	if writeErr != nil {
+		return readResult.responses, written, writeErr
+	}
+	if readResult.err != nil {
+		return readResult.responses, written, readResult.err
+	}
+	if !readResult.barrier {
+		return readResult.responses, written, &ProtocolError{Message: "pipeline omitted no-op barrier"}
+	}
+	safe = true
+	return readResult.responses, written, nil
 }
