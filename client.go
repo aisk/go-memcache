@@ -10,9 +10,10 @@ import (
 
 // Client is a concurrent meta-protocol memcached client.
 type Client struct {
-	config  config
-	servers []*serverPool
-	close   sync.Once
+	config        config
+	servers       []*serverPool
+	serverIndexes map[string]int
+	close         sync.Once
 }
 
 // New creates a lazy client. No connection is opened until the first command.
@@ -33,7 +34,13 @@ func New(server string, options ...Option) (*Client, error) {
 		return nil, fmt.Errorf("memcache: at least one server is required")
 	}
 	seen := make(map[string]struct{}, len(cfg.servers))
-	client := &Client{config: cfg, servers: make([]*serverPool, len(cfg.servers))}
+	client := &Client{
+		config:  cfg,
+		servers: make([]*serverPool, len(cfg.servers)),
+	}
+	if cfg.copyServersForRouter {
+		client.serverIndexes = make(map[string]int, len(cfg.servers))
+	}
 	for i, address := range cfg.servers {
 		if address == "" {
 			return nil, fmt.Errorf("memcache: server address %d is empty", i)
@@ -43,6 +50,9 @@ func New(server string, options ...Option) (*Client, error) {
 		}
 		seen[address] = struct{}{}
 		client.servers[i] = &serverPool{address: address, config: &client.config}
+		if client.serverIndexes != nil {
+			client.serverIndexes[address] = i
+		}
 	}
 	return client, nil
 }
@@ -60,11 +70,27 @@ func NewServers(servers []string, options ...Option) (*Client, error) {
 }
 
 func (c *Client) server(key string) (*serverPool, error) {
-	index := c.config.router.Pick(key, c.config.servers)
-	if index < 0 || index >= len(c.servers) {
+	if !c.config.copyServersForRouter {
+		index := c.config.router.Pick(key, c.config.servers)
+		if index < 0 || index >= len(c.servers) {
+			return nil, fmt.Errorf("memcache: router returned invalid server index %d", index)
+		}
+		return c.servers[index], nil
+	}
+
+	// A Router may reorder the slice it receives. Give it a private copy, then
+	// resolve the selected address back to the corresponding pool so its index
+	// is interpreted relative to the slice it actually saw.
+	servers := append([]string(nil), c.config.servers...)
+	index := c.config.router.Pick(key, servers)
+	if index < 0 || index >= len(servers) {
 		return nil, fmt.Errorf("memcache: router returned invalid server index %d", index)
 	}
-	return c.servers[index], nil
+	poolIndex, ok := c.serverIndexes[servers[index]]
+	if !ok {
+		return nil, fmt.Errorf("memcache: router selected unknown server address %q", servers[index])
+	}
+	return c.servers[poolIndex], nil
 }
 
 // Close releases idle connections and prevents new work. In-flight requests
@@ -159,7 +185,7 @@ func buildGet(key string, options GetOptions) (MetaCommand, error) {
 	if !options.MetadataOnly {
 		flags = append(flags, "v")
 	}
-	if options.ReturnCAS || options.VivifyTTL != nil || options.UnlessCAS != nil {
+	if options.ReturnCAS || options.VivifyTTL != nil || options.RefreshBefore != nil || options.UnlessCAS != nil {
 		flags = append(flags, "c")
 	}
 	if options.ReturnClientFlags {
@@ -203,7 +229,8 @@ func buildGet(key string, options GetOptions) (MetaCommand, error) {
 	return MetaCommand{Command: "mg", Key: key, Flags: flags}, err
 }
 
-// Get reads a value and maps a miss to ErrCacheMiss.
+// Get reads a value and maps a miss to ErrCacheMiss. A value marked stale by
+// memcached is still returned; use GetWithOptions to inspect its ValueState.
 func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
 	result, err := c.GetWithOptions(ctx, key, GetOptions{})
 	if err != nil {
@@ -639,7 +666,9 @@ func (c *Client) Debug(ctx context.Context, key string) (map[string]string, erro
 	return wire.Debug, nil
 }
 
-// GetInto decodes a cached value using the configured Codec.
+// GetInto decodes a cached value using the configured Codec. A value marked
+// stale by memcached is still decoded; use GetWithOptions to inspect its
+// ValueState before decoding when freshness matters.
 func (c *Client) GetInto(ctx context.Context, key string, destination any) error {
 	result, err := c.GetWithOptions(ctx, key, GetOptions{ReturnClientFlags: true})
 	if err != nil {

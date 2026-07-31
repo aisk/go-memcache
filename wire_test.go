@@ -5,7 +5,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -92,6 +97,96 @@ func TestBuildersValidateBeforeIO(t *testing.T) {
 		if test.err == nil {
 			t.Errorf("%s: expected error", test.name)
 		}
+	}
+}
+
+func TestRefreshBeforeRequestsCAS(t *testing.T) {
+	refresh := Expiration(30)
+	command, err := buildGet("key", GetOptions{RefreshBefore: &refresh})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(command.Flags, "c") {
+		t.Fatalf("RefreshBefore flags %v do not request CAS", command.Flags)
+	}
+}
+
+type sortingRouter struct{}
+
+func (sortingRouter) Pick(_ string, servers []string) int {
+	sort.Strings(servers)
+	return 0
+}
+
+func TestRouterMayReorderItsServerCopy(t *testing.T) {
+	client, err := NewServers([]string{"z.example:11211", "a.example:11211"}, WithRouter(sortingRouter{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const calls = 32
+	var wait sync.WaitGroup
+	errors := make(chan error, calls)
+	for range calls {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			server, err := client.server("key")
+			if err != nil {
+				errors <- err
+				return
+			}
+			if server.address != "a.example:11211" {
+				errors <- fmt.Errorf("selected pool %q, want %q", server.address, "a.example:11211")
+			}
+		}()
+	}
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		t.Error(err)
+	}
+	if got, want := client.config.servers, []string{"z.example:11211", "a.example:11211"}; !slices.Equal(got, want) {
+		t.Fatalf("router mutated client topology: got %v, want %v", got, want)
+	}
+}
+
+func TestDefaultRouterServerHasNoAllocations(t *testing.T) {
+	for _, servers := range [][]string{
+		{"a.example:11211"},
+		{"a.example:11211", "b.example:11211"},
+	} {
+		client, err := NewServers(servers)
+		if err != nil {
+			t.Fatal(err)
+		}
+		allocations := testing.AllocsPerRun(1000, func() {
+			server, err := client.server("key")
+			if err != nil || server == nil {
+				t.Fatalf("server = %#v, %v", server, err)
+			}
+		})
+		if allocations != 0 {
+			t.Fatalf("default router server() with %d servers allocated %v times per call, want 0", len(servers), allocations)
+		}
+	}
+}
+
+type replacingRouter struct{}
+
+func (replacingRouter) Pick(_ string, servers []string) int {
+	servers[0] = "unknown.example:11211"
+	return 0
+}
+
+func TestRouterCannotSelectUnknownAddress(t *testing.T) {
+	client, err := NewServers([]string{"a.example:11211"}, WithRouter(replacingRouter{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.server("key")
+	if err == nil || !strings.Contains(err.Error(), "unknown server address") {
+		t.Fatalf("got %v, want unknown server address error", err)
 	}
 }
 

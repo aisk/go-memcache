@@ -134,10 +134,21 @@ func TestIntegrationArithmeticLeaseStale(t *testing.T) {
 	if err != nil || stale.Status != GetHit || stale.ValueState != ValueStale {
 		t.Fatalf("stale get: %#v, %v", stale, err)
 	}
+	if err := c.Set(ctx, "early-lease", []byte("old"), ttl); err != nil {
+		t.Fatal(err)
+	}
 	refresh := Expiration(120)
-	early, err := c.GetWithOptions(ctx, "lease", GetOptions{RefreshBefore: &refresh})
-	if err != nil || early.Status != GetHit || early.Lease == LeaseNone {
+	early, err := c.GetWithOptions(ctx, "early-lease", GetOptions{RefreshBefore: &refresh})
+	if err != nil || early.Status != GetHit || early.Lease != LeaseGranted || early.Metadata.CAS == nil {
 		t.Fatalf("R-only early refresh: %#v, %v", early, err)
+	}
+	refreshed, err := c.FulfillLease(ctx, early, []byte("refreshed"), ttl)
+	if err != nil || !refreshed.Applied() {
+		t.Fatalf("fulfill R-only early refresh lease: %#v, %v", refreshed, err)
+	}
+	got, err := c.Get(ctx, "early-lease")
+	if err != nil || string(got) != "refreshed" {
+		t.Fatalf("get refreshed lease value: %q, %v", got, err)
 	}
 }
 

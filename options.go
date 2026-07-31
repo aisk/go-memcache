@@ -12,15 +12,16 @@ import (
 type DialContextFunc func(context.Context, string, string) (net.Conn, error)
 
 type config struct {
-	servers     []string
-	network     string
-	dial        DialContextFunc
-	dialTimeout time.Duration
-	ioTimeout   time.Duration
-	maxIdle     int
-	maxItemSize int
-	codec       Codec
-	router      Router
+	servers              []string
+	network              string
+	dial                 DialContextFunc
+	dialTimeout          time.Duration
+	ioTimeout            time.Duration
+	maxIdle              int
+	maxItemSize          int
+	codec                Codec
+	router               Router
+	copyServersForRouter bool
 }
 
 // Option configures a Client.
@@ -42,7 +43,10 @@ func defaultConfig(server string) config {
 }
 
 // Router selects a server index for a key. Implementations must be safe for
-// concurrent use and return an index in [0, len(servers)).
+// concurrent use and return an index in [0, len(servers)). Routers supplied
+// with WithRouter receive a slice private to each call and may reorder it
+// before Pick returns; the selected address is mapped back to its connection
+// pool. Implementations must not retain or mutate the slice after Pick returns.
 type Router interface {
 	Pick(key string, servers []string) int
 }
@@ -72,6 +76,7 @@ func WithRouter(router Router) Option {
 			return fmt.Errorf("memcache: nil router")
 		}
 		c.router = router
+		c.copyServersForRouter = true
 		return nil
 	}
 }
