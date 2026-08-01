@@ -38,7 +38,7 @@ profile, err := memcache.GetAs[Profile](ctx, client, "profile:1")
 
 The client never automatically retries a command after writing begins. If a side-effect may have reached memcached but the response/barrier was not seen, the error is an `AmbiguousWriteError`; blindly retrying arithmetic, append, or prepend could otherwise apply the mutation twice.
 
-Multiple servers use stable rendezvous hashing by default. `WithRouter` can replace it. Each server has an elastic concurrent connection pool: `maxIdle` limits retained idle connections, not active requests.
+Multiple servers use stable rendezvous hashing by default. `WithRouter` can replace it. Each server has an elastic concurrent connection pool: `maxIdle` limits retained idle connections, not active requests. Idle connections are reused most-recently-released first and are redialed once idle longer than `WithIdleTimeout` (90 seconds by default), so a connection silently dropped by a restarted server or an idle-timing-out middlebox is not handed to the next command.
 
 ```go
 client, err := memcache.NewServers([]string{

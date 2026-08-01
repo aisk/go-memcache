@@ -12,14 +12,15 @@ import (
 
 type pooledConn struct {
 	net.Conn
-	reader *bufio.Reader
+	reader    *bufio.Reader
+	idleSince time.Time
 }
 
 type serverPool struct {
 	address string
 	config  *config
 	mu      sync.Mutex
-	idle    []*pooledConn // FIFO: oldest is first.
+	idle    []*pooledConn // LIFO: most recently released is last.
 	closed  bool
 }
 
@@ -29,28 +30,54 @@ func (p *serverPool) acquire(ctx context.Context) (*pooledConn, error) {
 		p.mu.Unlock()
 		return nil, ErrClosed
 	}
-	if len(p.idle) != 0 {
-		conn := p.idle[0]
-		copy(p.idle, p.idle[1:])
-		p.idle = p.idle[:len(p.idle)-1]
-		p.mu.Unlock()
-		return conn, nil
+	// idle is ordered by release time, so expired connections form a prefix.
+	// Pruning it here keeps long-dead sockets from holding file descriptors
+	// while steady traffic keeps the newest connections fresh.
+	var expired []*pooledConn
+	if p.config.idleTimeout > 0 && len(p.idle) != 0 {
+		cutoff := time.Now().Add(-p.config.idleTimeout)
+		drop := 0
+		for drop < len(p.idle) && p.idle[drop].idleSince.Before(cutoff) {
+			drop++
+		}
+		if drop > 0 {
+			expired = append(expired, p.idle[:drop]...)
+			kept := copy(p.idle, p.idle[drop:])
+			for i := kept; i < len(p.idle); i++ {
+				p.idle[i] = nil
+			}
+			p.idle = p.idle[:kept]
+		}
+	}
+	// Take the most recently released connection: it is the least likely to
+	// have been silently dropped by the server or an intermediary while idle.
+	var conn *pooledConn
+	if n := len(p.idle); n != 0 {
+		conn = p.idle[n-1]
+		p.idle[n-1] = nil
+		p.idle = p.idle[:n-1]
 	}
 	p.mu.Unlock()
+	for _, stale := range expired {
+		_ = stale.Close()
+	}
+	if conn != nil {
+		return conn, nil
+	}
 	dialCtx := ctx
 	cancel := func() {}
 	if p.config.dialTimeout > 0 {
 		dialCtx, cancel = context.WithTimeout(ctx, p.config.dialTimeout)
 	}
 	defer cancel()
-	conn, err := p.config.dial(dialCtx, p.config.network, p.address)
+	dialed, err := p.config.dial(dialCtx, p.config.network, p.address)
 	if err != nil {
 		return nil, err
 	}
-	if tcp, ok := conn.(*net.TCPConn); ok {
+	if tcp, ok := dialed.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
 	}
-	return &pooledConn{Conn: conn, reader: bufio.NewReader(conn)}, nil
+	return &pooledConn{Conn: dialed, reader: bufio.NewReader(dialed)}, nil
 }
 
 func (p *serverPool) release(conn *pooledConn) {
@@ -60,6 +87,8 @@ func (p *serverPool) release(conn *pooledConn) {
 	}
 	p.mu.Lock()
 	if !p.closed && len(p.idle) < p.config.maxIdle {
+		// Stamped under the lock so idle stays ordered by release time.
+		conn.idleSince = time.Now()
 		p.idle = append(p.idle, conn)
 		p.mu.Unlock()
 		return

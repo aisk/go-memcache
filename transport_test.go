@@ -309,6 +309,114 @@ func TestPoolReuseAndClose(t *testing.T) {
 	}
 }
 
+func TestAcquireIsLIFO(t *testing.T) {
+	cfg := defaultConfig("addr")
+	pool := &serverPool{address: "addr", config: &cfg}
+	connect := func() *pooledConn {
+		client, _ := net.Pipe()
+		return &pooledConn{Conn: client, reader: bufio.NewReader(client)}
+	}
+	first, second := connect(), connect()
+	pool.release(first)
+	pool.release(second)
+	for _, want := range []*pooledConn{second, first} {
+		got, err := pool.acquire(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatal("acquire is not most-recently-released first")
+		}
+	}
+}
+
+func TestIdleTimeoutClosesStaleConnections(t *testing.T) {
+	cfg := defaultConfig("addr")
+	cfg.idleTimeout = 5 * time.Millisecond
+	var dials atomic.Int32
+	cfg.dial = func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		client, _ := net.Pipe()
+		return client, nil
+	}
+	pool := &serverPool{address: "addr", config: &cfg}
+	clientA, peerA := net.Pipe()
+	clientB, peerB := net.Pipe()
+	pool.release(&pooledConn{Conn: clientA, reader: bufio.NewReader(clientA)})
+	pool.release(&pooledConn{Conn: clientB, reader: bufio.NewReader(clientB)})
+	time.Sleep(20 * time.Millisecond)
+	if _, err := pool.acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want a fresh dial", dials.Load())
+	}
+	for _, peer := range []net.Conn{peerA, peerB} {
+		_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Fatalf("stale connection was not closed: %v", err)
+		}
+	}
+}
+
+func TestAcquirePrunesExpiredPrefix(t *testing.T) {
+	cfg := defaultConfig("addr")
+	cfg.idleTimeout = 25 * time.Millisecond
+	pool := &serverPool{address: "addr", config: &cfg}
+	staleClient, stalePeer := net.Pipe()
+	pool.release(&pooledConn{Conn: staleClient, reader: bufio.NewReader(staleClient)})
+	time.Sleep(50 * time.Millisecond)
+	freshClient, _ := net.Pipe()
+	fresh := &pooledConn{Conn: freshClient, reader: bufio.NewReader(freshClient)}
+	pool.release(fresh)
+	got, err := pool.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != fresh {
+		t.Fatal("acquire did not return the fresh connection")
+	}
+	_ = stalePeer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := stalePeer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("expired connection was not closed: %v", err)
+	}
+}
+
+func TestIdleTimeoutRedials(t *testing.T) {
+	var dials atomic.Int32
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			reader := bufio.NewReader(server)
+			for {
+				if _, err := reader.ReadString('\n'); err != nil {
+					return
+				}
+				if _, err := server.Write([]byte("EN\r\n")); err != nil {
+					return
+				}
+			}
+		}()
+		return client, nil
+	}
+	client, _ := New("pipe", WithDialer(dial), WithIdleTimeout(10*time.Millisecond))
+	get := func(want int32) {
+		t.Helper()
+		if _, err := client.Get(context.Background(), "key"); !errors.Is(err, ErrCacheMiss) {
+			t.Fatal(err)
+		}
+		if dials.Load() != want {
+			t.Fatalf("dials = %d, want %d", dials.Load(), want)
+		}
+	}
+	get(1)
+	get(1) // immediate reuse
+	time.Sleep(30 * time.Millisecond)
+	get(2) // idle connection expired
+}
+
 func TestMaxIdleZeroDisablesReuse(t *testing.T) {
 	var dials atomic.Int32
 	dial := func(ctx context.Context, network, address string) (net.Conn, error) {

@@ -17,6 +17,7 @@ type config struct {
 	dial                 DialContextFunc
 	dialTimeout          time.Duration
 	ioTimeout            time.Duration
+	idleTimeout          time.Duration
 	maxIdle              int
 	maxItemSize          int
 	codec                Codec
@@ -35,6 +36,7 @@ func defaultConfig(server string) config {
 		dial:        d.DialContext,
 		dialTimeout: time.Second,
 		ioTimeout:   time.Second,
+		idleTimeout: 90 * time.Second,
 		maxIdle:     23,
 		maxItemSize: 1024 * 1024,
 		codec:       JSONCodec{},
@@ -127,6 +129,21 @@ func WithDialTimeout(timeout time.Duration) Option {
 			return fmt.Errorf("memcache: dial timeout must not be negative")
 		}
 		c.dialTimeout = timeout
+		return nil
+	}
+}
+
+// WithIdleTimeout bounds how long a pooled connection may sit idle before it
+// is discarded and replaced by a fresh dial. Connections silently dropped by
+// a restarted server or an intermediary while idle would otherwise surface as
+// a spurious error, or as an AmbiguousWriteError on a mutation. Zero disables
+// the limit. The default is 90 seconds.
+func WithIdleTimeout(timeout time.Duration) Option {
+	return func(c *config) error {
+		if timeout < 0 {
+			return fmt.Errorf("memcache: idle timeout must not be negative")
+		}
+		c.idleTimeout = timeout
 		return nil
 	}
 }
