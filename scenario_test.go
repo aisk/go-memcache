@@ -42,8 +42,12 @@ func TestPolicyResolutionErrors(t *testing.T) {
 		"Replace":  func() error { _, err := client.Replace(ctx, "k", []byte("v"), -time.Second); return err },
 		"Fetch":    func() error { _, err := client.Fetch(ctx, "k", -time.Second, loader); return err },
 		"Update":   func() error { _, err := client.Update(ctx, "k", -time.Second, transform); return err },
-		"GetTouch": func() error { _, _, err := client.GetTouch(ctx, "k", -time.Second); return err },
-		"Touch":    func() error { return client.Touch(ctx, "k", -time.Second) },
+		"Get+Touch": func() error { _, _, err := client.Get(ctx, "k", Touch(-time.Second)); return err },
+		"GetMany+Touch": func() error {
+			_, err := client.GetMany(ctx, []string{"k"}, Touch(-time.Second))
+			return err
+		},
+		"Touch": func() error { return client.Touch(ctx, "k", -time.Second) },
 	}
 	for name, call := range negativeTTL {
 		if err := call(); err == nil || !strings.Contains(err.Error(), "negative") {
@@ -180,8 +184,8 @@ func TestDegradePolicyAgainstDeadBackend(t *testing.T) {
 	if found, err := client.GetMany(ctx, []string{"a", "b"}); err != nil || len(found) != 0 {
 		t.Fatalf("degraded get many: %#v, %v", found, err)
 	}
-	if _, ok, err := client.GetTouch(ctx, "k", time.Minute); err != nil || ok {
-		t.Fatalf("degraded get touch: ok=%v err=%v", ok, err)
+	if _, ok, err := client.Get(ctx, "k", Touch(time.Minute)); err != nil || ok {
+		t.Fatalf("degraded get with touch: ok=%v err=%v", ok, err)
 	}
 	if _, ok, err := client.Inspect(ctx, "k"); err != nil || ok {
 		t.Fatalf("degraded inspect: ok=%v err=%v", ok, err)

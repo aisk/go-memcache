@@ -44,6 +44,19 @@ func sceneReadOptions() GetOptions {
 	return GetOptions{ReturnCAS: true, ReturnTTL: true}
 }
 
+// policyReadOptions resolves per-call read options into the wire flag set.
+func policyReadOptions(policy callPolicy) (GetOptions, error) {
+	read := sceneReadOptions()
+	if policy.touch != nil {
+		expiration, err := resolveTTL(*policy.touch)
+		if err != nil {
+			return GetOptions{}, err
+		}
+		read.Touch = &expiration
+	}
+	return read, nil
+}
+
 // returnStaleWin hands an accidental stale-recache win back to the server.
 // memcached grants a stale entry's single recache token to the first reader
 // regardless of what it asked for, and never re-grants it until the entry is
@@ -91,7 +104,8 @@ func (c *Client) sceneStore(ctx context.Context, key string, value []byte, optio
 
 // Get reads a value. A miss is a normal answer, not an error: ok reports
 // presence, err reports infrastructure failure, and the two never mix. A
-// value kept stale by Invalidate is returned as an ordinary hit.
+// value kept stale by Invalidate is returned as an ordinary hit. The Touch
+// option makes the same command also slide the hit's expiration.
 func (c *Client) Get(ctx context.Context, key string, options ...GetOption) ([]byte, bool, error) {
 	policy := c.config.callPolicy()
 	for _, option := range options {
@@ -100,7 +114,11 @@ func (c *Client) Get(ctx context.Context, key string, options ...GetOption) ([]b
 		}
 		option.applyGet(&policy)
 	}
-	result, err := c.sceneGet(ctx, key, sceneReadOptions())
+	read, err := policyReadOptions(policy)
+	if err != nil {
+		return nil, false, err
+	}
+	result, err := c.sceneGet(ctx, key, read)
 	if err != nil {
 		return nil, false, err
 	}
@@ -121,9 +139,13 @@ func (c *Client) GetMany(ctx context.Context, keys []string, options ...GetOptio
 		}
 		option.applyGet(&policy)
 	}
+	read, err := policyReadOptions(policy)
+	if err != nil {
+		return nil, err
+	}
 	operations := make([]Operation, len(keys))
 	for i, key := range keys {
-		operations[i] = GetOperation{Key: key, Options: sceneReadOptions()}
+		operations[i] = GetOperation{Key: key, Options: read}
 	}
 	results, err := c.batch(ctx, operations)
 	if err != nil {
@@ -149,57 +171,6 @@ func (c *Client) GetMany(ctx context.Context, keys []string, options ...GetOptio
 		}
 	}
 	return found, firstErr
-}
-
-// GetTouch reads a value and slides its expiration to ttl. It is the read
-// half of session renewal. The slide is a CAS-gated rewrite of the value just
-// read rather than a blind server-side touch: a blind touch would also extend
-// an entry marked stale by Invalidate, keeping revoked data alive past its
-// grace period. An entry that is missing, stale, or invalidated mid-renewal
-// reads as a miss and keeps decaying.
-func (c *Client) GetTouch(ctx context.Context, key string, ttl time.Duration, options ...GetTouchOption) ([]byte, bool, error) {
-	policy := c.config.callPolicy()
-	for _, option := range options {
-		if option == nil {
-			return nil, false, errNilOption
-		}
-		option.applyGetTouch(&policy)
-	}
-	expiration, err := resolveTTL(ttl)
-	if err != nil {
-		return nil, false, err
-	}
-	read := sceneReadOptions()
-	read.ReturnClientFlags = true
-	for range updateAttempts {
-		result, err := c.sceneGet(ctx, key, read)
-		if err != nil {
-			return nil, false, err
-		}
-		if result.Status != GetHit || result.ValueState != ValueFresh || len(result.Value) == 0 {
-			return nil, false, nil
-		}
-		if result.Metadata.CAS == nil {
-			return nil, false, &ProtocolError{Message: "value read omitted requested CAS"}
-		}
-		write := SetOptions{TTL: expiration, Mode: ModeReplace, CompareCAS: result.Metadata.CAS}
-		if result.Metadata.ClientFlags != nil {
-			write.ClientFlags = *result.Metadata.ClientFlags
-		}
-		status, err := c.sceneStore(ctx, key, result.Value, write)
-		if err != nil {
-			if c.absorb(ctx, err) {
-				// The read succeeded; under Degrade the slide is best-effort.
-				return result.Value, true, nil
-			}
-			return nil, false, err
-		}
-		if status == MutationApplied {
-			return result.Value, true, nil
-		}
-		// The entry changed between read and renewal; read again.
-	}
-	return nil, false, ErrConflict
 }
 
 // Set unconditionally stores a value for ttl. Storing without expiration is
@@ -445,7 +416,11 @@ func (c *Client) DeleteMany(ctx context.Context, keys []string) error {
 // Invalidate marks a value stale instead of dropping it. For the grace
 // period, readers keep the old copy while Fetch elects one caller to
 // recompute in the background; afterwards the key decays into a normal miss.
-// Use Delete when the old value must not be served for even a second.
+// The grace bound also guarantees recovery when an elected recomputer crashes
+// without writing: the entry dies on schedule and the next Fetch re-elects.
+// It is an upper bound only while nothing renews the key, since Touch slides
+// it like any other expiration. Invalidate pairs with Fetch-managed keys; use
+// Delete when the old value must not be served for even a second.
 func (c *Client) Invalidate(ctx context.Context, key string, grace time.Duration) error {
 	if grace <= 0 {
 		return fmt.Errorf("memcache: Invalidate grace must be positive")
@@ -467,27 +442,16 @@ func (c *Client) Invalidate(ctx context.Context, key string, grace time.Duration
 	return err
 }
 
-// Touch extends a key's TTL without transferring its value. A missing key is
-// not an error; there is simply nothing left to extend. An entry marked stale
-// by Invalidate is left alone: extending it would keep revoked data alive, so
-// it keeps decaying toward its miss.
+// Touch extends a key's TTL without transferring its value, as one blind
+// protocol command. A missing key is not an error; there is simply nothing
+// left to extend. The touch is memcached's native one and applies to whatever
+// it hits, including an entry kept stale by Invalidate, so a revocation that
+// must stick goes through Delete.
 func (c *Client) Touch(ctx context.Context, key string, ttl time.Duration) error {
-	if _, err := resolveTTL(ttl); err != nil {
-		return err
-	}
-	probe := sceneReadOptions()
-	probe.MetadataOnly = true
-	result, err := c.sceneGet(ctx, key, probe)
+	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return err
 	}
-	if result.Status != GetHit || result.ValueState != ValueFresh {
-		return nil
-	}
-	// The protocol has no CAS-gated touch, so the extension is a second
-	// command: an Invalidate can still slip in between the two, but the
-	// exposure shrinks from every call to one round-trip window.
-	expiration := ExpiresIn(ttl)
 	touch := sceneReadOptions()
 	touch.MetadataOnly = true
 	touch.Touch = &expiration

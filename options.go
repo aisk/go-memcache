@@ -60,14 +60,8 @@ type PolicyOption interface {
 // verb's interface. Each interface carries its own unexported method so the
 // interfaces stay structurally distinct.
 
-// GetOption modifies a single Get call. No shipped option currently applies
-// to a plain read; the parameter exists so future options need no signature
-// change.
+// GetOption modifies a single Get or GetMany call.
 type GetOption interface{ applyGet(*callPolicy) }
-
-// GetTouchOption modifies a GetTouch call. No shipped option currently
-// applies; the parameter exists so future options need no signature change.
-type GetTouchOption interface{ applyGetTouch(*callPolicy) }
 
 // SetOption modifies a Set, SetMany, Add, or Replace call. No shipped option
 // currently applies; the parameter exists so future options need no signature
@@ -93,6 +87,7 @@ type AppendOption interface{ applyAppend(*callPolicy) }
 // callPolicy resolves per-call options against New-level policy defaults.
 type callPolicy struct {
 	refreshAhead *time.Duration
+	touch        *time.Duration
 }
 
 func (c *config) callPolicy() callPolicy {
@@ -114,6 +109,17 @@ func resolveTTL(ttl time.Duration) (Expiration, error) {
 	}
 	return ExpiresIn(ttl), nil
 }
+
+type touchOption time.Duration
+
+func (o touchOption) applyGet(p *callPolicy) { p.touch = ptr(time.Duration(o)) }
+
+// Touch makes a read slide each hit's expiration to ttl in the same protocol
+// command, which turns Get into the read half of session renewal. The slide
+// is memcached's native touch and is blind: it extends whatever the read
+// hits, including an entry kept stale by Invalidate, so a revocation that
+// must stick goes through Delete. Touch(Forever) removes the expiration.
+func Touch(ttl time.Duration) GetOption { return touchOption(ttl) }
 
 type refreshAheadOption time.Duration
 

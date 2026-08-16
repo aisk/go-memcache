@@ -18,7 +18,7 @@ API 的设计意图是把底层协议屏蔽在以使用场景命名的方法后�
   ```
 
 - 在会自动创建 key 的方法上（`Incr`、`Decr`、`Append`、`Prepend`），TTL 只在这次调用创建了 key 时生效，永远不会延长已存在 key 的寿命。
-- 可选修饰符按方法类型化。`RefreshAhead` 只被 `Fetch` 接受，把选项用在没有意义的方法上是编译错误，而不是运行时的意外。
+- 可选修饰符按方法类型化。`Touch` 只被 `Get` 和 `GetMany` 接受，`RefreshAhead` 只被 `Fetch` 接受，把选项用在没有意义的方法上是编译错误，而不是运行时的意外。
 
 ## 创建客户端
 
@@ -41,9 +41,8 @@ defer mc.Close()
 ## 读取
 
 ```go
-func (c *Client) Get(ctx context.Context, key string) (value []byte, ok bool, err error)
-func (c *Client) GetMany(ctx context.Context, keys []string) (map[string][]byte, error)
-func (c *Client) GetTouch(ctx context.Context, key string, ttl time.Duration) (value []byte, ok bool, err error)
+func (c *Client) Get(ctx context.Context, key string, options ...GetOption) (value []byte, ok bool, err error)
+func (c *Client) GetMany(ctx context.Context, keys []string, options ...GetOption) (map[string][]byte, error)
 func (c *Client) Inspect(ctx context.Context, key string) (info ItemInfo, ok bool, err error)
 ```
 
@@ -57,7 +56,13 @@ if !ok { /* miss */ }
 
 `GetMany` 对每个后端一次往返批量读取一组 key，返回命中的部分，未命中表现为返回 map 中 key 的缺失。
 
-`GetTouch` 读取一个值并在同一次调用中把它的过期时间顺延到 `ttl`，是会话续期的读取一半。
+`Touch(ttl)` 选项让同一条协议命令在读取的同时把命中值的过期时间顺延到 `ttl`，这使 `Get` 成为会话续期的读取一半。
+
+```go
+session, ok, err := mc.Get(ctx, "session:"+sid, memcache.Touch(30*time.Minute))
+```
+
+这个顺延就是 memcached 原生的 touch，是盲目的：读到什么就延长什么，包括被 `Invalidate` 标记为过时的值。必须立刻生效的撤销要走 `Delete`。
 
 `Inspect` 返回条目的元数据（剩余 TTL、大小、最近访问时间、是否曾被命中），不传输值也不影响它的 LRU 位置，是一个观测工具。
 
@@ -85,11 +90,11 @@ if won { /* this process runs the job */ }
 
 `Replace` 只在 key 仍然存在时存储，并报告是否写入了。它是会话续期的写入一半，`false` 表示会话已经结束。
 
-`Touch` 只延长 key 的 TTL，不传输值。key 不存在不算错误。
+`Touch` 只延长 key 的 TTL，不传输值，是一条盲目的协议命令。key 不存在不算错误。
 
 `Delete` 删除一个 key，删除不存在的 key 视为成功，因为目标状态已经成立。`DeleteMany` 对每个后端一次往返批量删除。
 
-`Invalidate` 把值标记为过时而不是直接删除。在 `grace` 期间读者继续拿到旧值，同时 `Fetch` 会选出一个调用者在后台重新计算；之后这个 key 衰变为正常的未命中。如果旧值一秒都不能再被返回，就用 `Delete`。
+`Invalidate` 把值标记为过时而不是直接删除。在 `grace` 期间读者继续拿到旧值，同时 `Fetch` 会选出一个调用者在后台重新计算；之后这个 key 衰变为正常的未命中。`Invalidate` 与 `Fetch` 管理的 key 配套使用：`grace` 只在没有人续期这个 key 时才是上界，touch 会像顺延普通过期时间一样顺延它。如果旧值一秒都不能再被返回，就用 `Delete`。
 
 ## 读取或计算
 

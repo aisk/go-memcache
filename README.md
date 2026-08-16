@@ -18,7 +18,7 @@ The API is designed to hide the wire protocol behind verbs named after what you 
   ```
 
 - On verbs that auto create the key (`Incr`, `Decr`, `Append`, `Prepend`) the TTL applies only when the call creates the key. It never extends an existing key's lifetime.
-- Optional modifiers are typed per verb. `RefreshAhead` is accepted only by `Fetch`, so putting an option on a verb it has no meaning for is a compile error rather than a runtime surprise.
+- Optional modifiers are typed per verb. `Touch` is accepted only by `Get` and `GetMany`, `RefreshAhead` only by `Fetch`, so putting an option on a verb it has no meaning for is a compile error rather than a runtime surprise.
 
 ## Creating a client
 
@@ -41,9 +41,8 @@ Other options: `WithTimeout` (per request), `WithDialTimeout`, `WithNetwork`, `W
 ## Reading
 
 ```go
-func (c *Client) Get(ctx context.Context, key string) (value []byte, ok bool, err error)
-func (c *Client) GetMany(ctx context.Context, keys []string) (map[string][]byte, error)
-func (c *Client) GetTouch(ctx context.Context, key string, ttl time.Duration) (value []byte, ok bool, err error)
+func (c *Client) Get(ctx context.Context, key string, options ...GetOption) (value []byte, ok bool, err error)
+func (c *Client) GetMany(ctx context.Context, keys []string, options ...GetOption) (map[string][]byte, error)
 func (c *Client) Inspect(ctx context.Context, key string) (info ItemInfo, ok bool, err error)
 ```
 
@@ -57,7 +56,13 @@ if !ok { /* miss */ }
 
 `GetMany` reads a set of keys in one round trip per backend and returns the hits. A miss is expressed by key absence in the returned map.
 
-`GetTouch` reads a value and slides its expiration to `ttl` in the same call. It is the read half of session renewal.
+The `Touch(ttl)` option makes the same protocol command also slide each hit's expiration to `ttl`, which turns `Get` into the read half of session renewal.
+
+```go
+session, ok, err := mc.Get(ctx, "session:"+sid, memcache.Touch(30*time.Minute))
+```
+
+The slide is memcached's native touch and is blind: it extends whatever the read hits, including a value kept stale by `Invalidate`. A revocation that must stick goes through `Delete`.
 
 `Inspect` returns an item's metadata (remaining TTL, size, last access, whether it was ever hit) without transferring the value or bumping its LRU position. It is an observability tool.
 
@@ -85,11 +90,11 @@ if won { /* this process runs the job */ }
 
 `Replace` stores only when the key still exists and reports whether it did. It is the write half of session renewal, where `false` means the session already ended.
 
-`Touch` extends a key's TTL without transferring its value. A missing key is not an error.
+`Touch` extends a key's TTL without transferring its value, as one blind protocol command. A missing key is not an error.
 
 `Delete` removes a key. Deleting an absent key is a success, since the goal state already holds. `DeleteMany` removes a batch in one round trip per backend.
 
-`Invalidate` marks a value stale instead of dropping it. For the `grace` period readers keep serving the old copy while `Fetch` elects one caller to recompute in the background; afterwards the key decays into a normal miss. Use `Delete` when the old value must not be served for even a second.
+`Invalidate` marks a value stale instead of dropping it. For the `grace` period readers keep serving the old copy while `Fetch` elects one caller to recompute in the background; afterwards the key decays into a normal miss. `Invalidate` pairs with keys managed by `Fetch`: the `grace` bound holds only while nothing renews the key, since a touch slides it like any other expiration. Use `Delete` when the old value must not be served for even a second.
 
 ## Get or compute
 

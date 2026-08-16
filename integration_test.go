@@ -123,15 +123,15 @@ func TestIntegrationSessionRenewal(t *testing.T) {
 	ctx := context.Background()
 	const sessionTTL = time.Minute
 
-	if _, ok, err := c.GetTouch(ctx, "session:1", sessionTTL); err != nil || ok {
+	if _, ok, err := c.Get(ctx, "session:1", Touch(sessionTTL)); err != nil || ok {
 		t.Fatalf("expired session: ok=%v err=%v", ok, err)
 	}
 	if err := c.Set(ctx, "session:1", []byte("s"), 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	got, ok, err := c.GetTouch(ctx, "session:1", sessionTTL)
+	got, ok, err := c.Get(ctx, "session:1", Touch(sessionTTL))
 	if err != nil || !ok || string(got) != "s" {
-		t.Fatalf("get touch: %q ok=%v err=%v", got, ok, err)
+		t.Fatalf("get with touch: %q ok=%v err=%v", got, ok, err)
 	}
 	info, ok, err := c.Inspect(ctx, "session:1")
 	if err != nil || !ok || info.TTL <= 2*time.Second {
@@ -721,9 +721,11 @@ func TestIntegrationFetchLoaderErrorReleasesLease(t *testing.T) {
 	}
 }
 
-// GetTouch and Touch must not extend an entry marked stale by Invalidate:
-// renewing revoked data would keep serving it past its grace period.
-func TestIntegrationTouchDoesNotReviveInvalidated(t *testing.T) {
+// Touch is protocol-native and blind: it extends whatever it hits, including
+// an entry kept stale by Invalidate. The grace given to Invalidate is an
+// upper bound only while nothing renews the key; a revocation that must
+// stick goes through Delete.
+func TestIntegrationTouchIsBlindTowardInvalidated(t *testing.T) {
 	c := integrationClient(t)
 	ctx := context.Background()
 	if err := c.Set(ctx, "session:9", []byte("s"), time.Minute); err != nil {
@@ -732,18 +734,16 @@ func TestIntegrationTouchDoesNotReviveInvalidated(t *testing.T) {
 	if err := c.Invalidate(ctx, "session:9", 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := c.GetTouch(ctx, "session:9", time.Hour); err != nil || ok {
-		t.Fatalf("stale get touch: ok=%v err=%v", ok, err)
-	}
-	if err := c.Touch(ctx, "session:9", time.Hour); err != nil {
-		t.Fatal(err)
+	got, ok, err := c.Get(ctx, "session:9", Touch(time.Hour))
+	if err != nil || !ok || string(got) != "s" {
+		t.Fatalf("stale read with touch: %q ok=%v err=%v", got, ok, err)
 	}
 	info, ok, err := c.Inspect(ctx, "session:9")
 	if err != nil || !ok {
 		t.Fatalf("inspect: ok=%v err=%v", ok, err)
 	}
-	if info.TTL > 3*time.Second {
-		t.Fatalf("invalidated entry was extended: %v", info.TTL)
+	if info.TTL <= 3*time.Second {
+		t.Fatalf("blind touch did not extend the stale entry: %v", info.TTL)
 	}
 }
 
