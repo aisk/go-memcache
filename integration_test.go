@@ -435,29 +435,29 @@ func TestIntegrationMetaLayer(t *testing.T) {
 	ctx := context.Background()
 	meta := c.Meta()
 
-	stored, err := meta.Set(ctx, "metadata", []byte("abc"), SetOptions{ReturnCAS: true, ReturnSize: true, ReturnKey: true, Opaque: "request-1"})
+	stored, err := meta.Set(ctx, "metadata", []byte("abc"), MetaSetOptions{ReturnCAS: true, ReturnSize: true, ReturnKey: true, Opaque: "request-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stored.CAS == nil || stored.Size == nil || *stored.Size != 3 || string(stored.ReturnedKey) != "metadata" || stored.Opaque != "request-1" {
 		t.Fatalf("store response metadata: %#v", stored)
 	}
-	got, err := meta.Get(ctx, "metadata", GetOptions{ReturnCAS: true})
+	got, err := meta.Get(ctx, "metadata", MetaGetOptions{ReturnCAS: true})
 	if err != nil || got.Status != GetHit || string(got.Value) != "abc" || got.Metadata.CAS == nil {
 		t.Fatalf("meta get: %#v, %v", got, err)
 	}
 	staleFor := Expiration(60)
-	invalidated, err := meta.Delete(ctx, "metadata", DeleteOptions{Invalidate: true, StaleFor: &staleFor})
+	invalidated, err := meta.Delete(ctx, "metadata", MetaDeleteOptions{Invalidate: true, StaleFor: &staleFor})
 	if err != nil || !invalidated.Applied() {
 		t.Fatalf("invalidate: %#v, %v", invalidated, err)
 	}
-	stale, err := meta.Get(ctx, "metadata", GetOptions{})
+	stale, err := meta.Get(ctx, "metadata", MetaGetOptions{})
 	if err != nil || stale.Status != GetHit || stale.ValueState != ValueStale {
 		t.Fatalf("stale get: %#v, %v", stale, err)
 	}
 
 	initial, ttl := uint64(10), Expiration(60)
-	counter, err := meta.Arithmetic(ctx, "counter", ArithmeticOptions{Delta: 2, Initial: &initial, InitialTTL: &ttl})
+	counter, err := meta.Arithmetic(ctx, "counter", MetaArithmeticOptions{Delta: 2, Initial: &initial, InitialTTL: &ttl})
 	if err != nil || !counter.HasValue || counter.Value != 10 {
 		t.Fatalf("arithmetic: %#v, %v", counter, err)
 	}
@@ -483,7 +483,7 @@ func TestIntegrationMetaLayer(t *testing.T) {
 	if err := c.Set(ctx, key, []byte("x"), time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	command, err := buildGet(key, GetOptions{ReturnKey: true})
+	command, err := buildGet(key, MetaGetOptions{ReturnKey: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -557,7 +557,7 @@ func TestIntegrationMultiServerPartialFailure(t *testing.T) {
 func TestIntegrationZeroByteValueReadsAsMiss(t *testing.T) {
 	c := integrationClient(t)
 	ctx := context.Background()
-	if _, err := c.Meta().Set(ctx, "empty", []byte{}, SetOptions{TTL: 60}); err != nil {
+	if _, err := c.Meta().Set(ctx, "empty", []byte{}, MetaSetOptions{TTL: 60}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, err := c.Get(ctx, "empty"); err != nil || ok {
@@ -586,7 +586,7 @@ func TestIntegrationFetchBusyLeaseFallsBack(t *testing.T) {
 	ctx := context.Background()
 	// Another process grabs the lease first.
 	lease := Expiration(30)
-	foreign, err := c.Meta().Get(ctx, "busy", GetOptions{VivifyTTL: &lease})
+	foreign, err := c.Meta().Get(ctx, "busy", MetaGetOptions{VivifyTTL: &lease})
 	if err != nil || foreign.Lease != LeaseGranted {
 		t.Fatalf("foreign lease: %#v, %v", foreign, err)
 	}
@@ -752,7 +752,7 @@ func TestIntegrationTouchIsBlindTowardInvalidated(t *testing.T) {
 func TestIntegrationFetchRepairsStoredEmptyValue(t *testing.T) {
 	c := integrationClient(t)
 	ctx := context.Background()
-	if _, err := c.Meta().Set(ctx, "hollow", []byte{}, SetOptions{TTL: 60}); err != nil {
+	if _, err := c.Meta().Set(ctx, "hollow", []byte{}, MetaSetOptions{TTL: 60}); err != nil {
 		t.Fatal(err)
 	}
 	value, err := c.Fetch(ctx, "hollow", time.Minute, func(context.Context) ([]byte, error) {
@@ -773,7 +773,7 @@ func TestIntegrationFetchFallbackMergesLoaders(t *testing.T) {
 	ctx := context.Background()
 	// Another process grabs the lease and never delivers.
 	lease := Expiration(30)
-	foreign, err := c.Meta().Get(ctx, "held", GetOptions{VivifyTTL: &lease})
+	foreign, err := c.Meta().Get(ctx, "held", MetaGetOptions{VivifyTTL: &lease})
 	if err != nil || foreign.Lease != LeaseGranted {
 		t.Fatalf("foreign lease: %#v, %v", foreign, err)
 	}

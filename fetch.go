@@ -80,7 +80,7 @@ func (c *Client) Fetch(ctx context.Context, key string, ttl time.Duration, loade
 		refreshBefore = ptr(ExpiresIn(refreshWindow))
 	}
 	lease := ExpiresIn(fetchLeaseTTL)
-	readOptions := GetOptions{ReturnCAS: true, VivifyTTL: &lease, RefreshBefore: refreshBefore}
+	readOptions := MetaGetOptions{ReturnCAS: true, VivifyTTL: &lease, RefreshBefore: refreshBefore}
 	command, err := buildGet(key, readOptions)
 	if err != nil {
 		return nil, err
@@ -242,7 +242,7 @@ func (c *Client) localCompute(ctx context.Context, key string, loader func(conte
 // rewrite wins and the delete quietly stands down; only transport failures
 // are worth reporting.
 func (c *Client) releaseLease(key string, cas uint64) {
-	command, err := buildDelete(key, DeleteOptions{CompareCAS: &cas})
+	command, err := buildDelete(key, MetaDeleteOptions{CompareCAS: &cas})
 	if err == nil {
 		var wire RawResponse
 		if wire, err = c.executeMeta(c.rootCtx, command); err == nil {
@@ -304,7 +304,7 @@ func (c *Client) spawnRefresh(key string, cas uint64, ttl Expiration, window tim
 // dead data, so a rejected write is abandoned. Write-back failures never
 // change what Fetch returns; they are observability events.
 func (c *Client) writeBack(key string, value []byte, cas uint64, ttl Expiration) {
-	command, err := buildSet(key, value, SetOptions{TTL: ttl, CompareCAS: &cas})
+	command, err := buildSet(key, value, MetaSetOptions{TTL: ttl, CompareCAS: &cas})
 	if err == nil {
 		var wire RawResponse
 		wire, err = c.executeMeta(c.rootCtx, command)

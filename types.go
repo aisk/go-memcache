@@ -150,13 +150,13 @@ const (
 	ModePrepend
 )
 
-// GetOptions exposes meta get behavior. Zero values perform a normal value
+// MetaGetOptions exposes meta get behavior. Zero values perform a normal value
 // read. Set MetadataOnly for an explicit metadata-only operation. When
 // VivifyTTL and RefreshBefore are combined, the wire protocol cannot
 // distinguish a real empty value won for early refresh from a newly vivified
 // empty placeholder. Value-bearing reads use the reference clients' empty
 // value heuristic; metadata-only reads reject that combination.
-type GetOptions struct {
+type MetaGetOptions struct {
 	MetadataOnly      bool
 	ReturnCAS         bool
 	ReturnTTL         bool
@@ -174,8 +174,8 @@ type GetOptions struct {
 	Opaque            string
 }
 
-// SetOptions exposes meta set behavior.
-type SetOptions struct {
+// MetaSetOptions exposes meta set behavior.
+type MetaSetOptions struct {
 	TTL         Expiration
 	ClientFlags uint32
 	Mode        StoreMode
@@ -189,8 +189,8 @@ type SetOptions struct {
 	Opaque      string
 }
 
-// DeleteOptions exposes meta delete behavior.
-type DeleteOptions struct {
+// MetaDeleteOptions exposes meta delete behavior.
+type MetaDeleteOptions struct {
 	CompareCAS *uint64
 	SetCAS     *uint64
 	Invalidate bool
@@ -200,8 +200,8 @@ type DeleteOptions struct {
 	Opaque     string
 }
 
-// ArithmeticOptions exposes meta arithmetic behavior.
-type ArithmeticOptions struct {
+// MetaArithmeticOptions exposes meta arithmetic behavior.
+type MetaArithmeticOptions struct {
 	Delta        uint64
 	Decrement    bool
 	Initial      *uint64

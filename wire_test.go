@@ -87,11 +87,11 @@ func TestBuildersValidateBeforeIO(t *testing.T) {
 		name string
 		err  error
 	}{
-		{"add with CAS", func() error { _, e := buildSet("k", nil, SetOptions{Mode: ModeAdd, CompareCAS: &cas}); return e }()},
-		{"invalidate without CAS", func() error { _, e := buildSet("k", nil, SetOptions{Invalidate: true}); return e }()},
-		{"append TTL", func() error { _, e := buildSet("k", nil, SetOptions{Mode: ModeAppend, TTL: 3}); return e }()},
-		{"stale TTL", func() error { _, e := buildDelete("k", DeleteOptions{StaleFor: &ttl}); return e }()},
-		{"initial pair", func() error { _, e := buildArithmetic("k", ArithmeticOptions{Initial: &cas}); return e }()},
+		{"add with CAS", func() error { _, e := buildSet("k", nil, MetaSetOptions{Mode: ModeAdd, CompareCAS: &cas}); return e }()},
+		{"invalidate without CAS", func() error { _, e := buildSet("k", nil, MetaSetOptions{Invalidate: true}); return e }()},
+		{"append TTL", func() error { _, e := buildSet("k", nil, MetaSetOptions{Mode: ModeAppend, TTL: 3}); return e }()},
+		{"stale TTL", func() error { _, e := buildDelete("k", MetaDeleteOptions{StaleFor: &ttl}); return e }()},
+		{"initial pair", func() error { _, e := buildArithmetic("k", MetaArithmeticOptions{Initial: &cas}); return e }()},
 	}
 	for _, test := range tests {
 		if test.err == nil {
@@ -102,7 +102,7 @@ func TestBuildersValidateBeforeIO(t *testing.T) {
 
 func TestRefreshBeforeRequestsCAS(t *testing.T) {
 	refresh := Expiration(30)
-	command, err := buildGet("key", GetOptions{RefreshBefore: &refresh})
+	command, err := buildGet("key", MetaGetOptions{RefreshBefore: &refresh})
 	if err != nil {
 		t.Fatal(err)
 	}

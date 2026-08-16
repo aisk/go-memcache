@@ -109,7 +109,7 @@ func TestCanceledMutatingGetIsAmbiguous(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	ttl := Expiration(30)
-	go func() { _, err := client.Meta().Get(ctx, "key", GetOptions{Touch: &ttl}); done <- err }()
+	go func() { _, err := client.Meta().Get(ctx, "key", MetaGetOptions{Touch: &ttl}); done <- err }()
 	<-requestRead
 	cancel()
 	err := <-done
@@ -220,7 +220,7 @@ func TestMissingRequiredBatchResponseIsAmbiguous(t *testing.T) {
 	})
 	client, _ := New("pipe", WithDialer(dial))
 	results, err := client.Meta().Batch(context.Background(), []Operation{
-		SetOperation{Key: "key", Value: []byte("x"), Options: SetOptions{ReturnCAS: true}},
+		SetOperation{Key: "key", Value: []byte("x"), Options: MetaSetOptions{ReturnCAS: true}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -242,7 +242,7 @@ func TestMissingVivifyResponseIsAmbiguous(t *testing.T) {
 	client, _ := New("pipe", WithDialer(dial))
 	ttl := Expiration(30)
 	results, err := client.Meta().Batch(context.Background(), []Operation{
-		GetOperation{Key: "key", Options: GetOptions{VivifyTTL: &ttl}},
+		GetOperation{Key: "key", Options: MetaGetOptions{VivifyTTL: &ttl}},
 	})
 	if err != nil {
 		t.Fatal(err)

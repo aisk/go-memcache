@@ -13,7 +13,7 @@ type MetaClient struct{ client *Client }
 func (c *Client) Meta() *MetaClient { return &MetaClient{client: c} }
 
 // Get performs a configurable meta get.
-func (m *MetaClient) Get(ctx context.Context, key string, options GetOptions) (GetResult, error) {
+func (m *MetaClient) Get(ctx context.Context, key string, options MetaGetOptions) (GetResult, error) {
 	command, err := buildGet(key, options)
 	if err != nil {
 		return GetResult{}, err
@@ -26,7 +26,7 @@ func (m *MetaClient) Get(ctx context.Context, key string, options GetOptions) (G
 }
 
 // Set performs a configurable meta set in any of its five modes.
-func (m *MetaClient) Set(ctx context.Context, key string, value []byte, options SetOptions) (MutationResult, error) {
+func (m *MetaClient) Set(ctx context.Context, key string, value []byte, options MetaSetOptions) (MutationResult, error) {
 	command, err := buildSet(key, value, options)
 	if err != nil {
 		return MutationResult{}, err
@@ -40,7 +40,7 @@ func (m *MetaClient) Set(ctx context.Context, key string, value []byte, options 
 }
 
 // Delete performs a configurable meta delete or stale invalidation.
-func (m *MetaClient) Delete(ctx context.Context, key string, options DeleteOptions) (MutationResult, error) {
+func (m *MetaClient) Delete(ctx context.Context, key string, options MetaDeleteOptions) (MutationResult, error) {
 	command, err := buildDelete(key, options)
 	if err != nil {
 		return MutationResult{}, err
@@ -54,7 +54,7 @@ func (m *MetaClient) Delete(ctx context.Context, key string, options DeleteOptio
 }
 
 // Arithmetic performs configurable unsigned 64-bit meta arithmetic.
-func (m *MetaClient) Arithmetic(ctx context.Context, key string, options ArithmeticOptions) (ArithmeticResult, error) {
+func (m *MetaClient) Arithmetic(ctx context.Context, key string, options MetaArithmeticOptions) (ArithmeticResult, error) {
 	command, err := buildArithmetic(key, options)
 	if err != nil {
 		return ArithmeticResult{}, err

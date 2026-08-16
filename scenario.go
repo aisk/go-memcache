@@ -17,7 +17,7 @@ var errEmptyValue = errors.New("memcache: empty values are reserved as lease pla
 // sceneGet executes one scenario-layer read. Usage errors surface as-is;
 // infrastructure failures are folded into a miss when Degrade is enabled.
 // An accidental stale-recache win is handed back to the server.
-func (c *Client) sceneGet(ctx context.Context, key string, options GetOptions) (GetResult, error) {
+func (c *Client) sceneGet(ctx context.Context, key string, options MetaGetOptions) (GetResult, error) {
 	command, err := buildGet(key, options)
 	if err != nil {
 		return GetResult{}, err
@@ -40,17 +40,17 @@ func (c *Client) sceneGet(ctx context.Context, key string, options GetOptions) (
 
 // sceneReadOptions is the flag set for plain scenario reads. CAS and TTL are
 // requested so an accidental stale-recache win can be handed back.
-func sceneReadOptions() GetOptions {
-	return GetOptions{ReturnCAS: true, ReturnTTL: true}
+func sceneReadOptions() MetaGetOptions {
+	return MetaGetOptions{ReturnCAS: true, ReturnTTL: true}
 }
 
 // policyReadOptions resolves per-call read options into the wire flag set.
-func policyReadOptions(policy callPolicy) (GetOptions, error) {
+func policyReadOptions(policy callPolicy) (MetaGetOptions, error) {
 	read := sceneReadOptions()
 	if policy.touch != nil {
 		expiration, err := resolveTTL(*policy.touch)
 		if err != nil {
-			return GetOptions{}, err
+			return MetaGetOptions{}, err
 		}
 		read.Touch = &expiration
 	}
@@ -69,7 +69,7 @@ func (c *Client) returnStaleWin(key string, result GetResult) {
 	if cas == nil || ttl == nil {
 		return
 	}
-	options := DeleteOptions{Invalidate: true, CompareCAS: cas}
+	options := MetaDeleteOptions{Invalidate: true, CompareCAS: cas}
 	if *ttl > 0 {
 		// The remaining TTL is raw seconds; beyond 30 days memcached would
 		// read it as a Unix timestamp, so it must go through ExpiresIn.
@@ -90,7 +90,7 @@ func (c *Client) returnStaleWin(key string, result GetResult) {
 }
 
 // sceneStore executes one scenario-layer write and reports its outcome.
-func (c *Client) sceneStore(ctx context.Context, key string, value []byte, options SetOptions) (MutationStatus, error) {
+func (c *Client) sceneStore(ctx context.Context, key string, value []byte, options MetaSetOptions) (MutationStatus, error) {
 	command, err := buildSet(key, value, options)
 	if err != nil {
 		return MutationUnknown, err
@@ -183,7 +183,7 @@ func (c *Client) Set(ctx context.Context, key string, value []byte, ttl time.Dur
 	if len(value) == 0 {
 		return errEmptyValue
 	}
-	status, err := c.sceneStore(ctx, key, value, SetOptions{TTL: expiration})
+	status, err := c.sceneStore(ctx, key, value, MetaSetOptions{TTL: expiration})
 	if err != nil {
 		if c.absorb(ctx, err) {
 			return nil
@@ -208,7 +208,7 @@ func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, ttl tim
 		if len(value) == 0 {
 			return fmt.Errorf("memcache: value for %q: %w", key, errEmptyValue)
 		}
-		operations = append(operations, SetOperation{Key: key, Value: value, Options: SetOptions{TTL: expiration}})
+		operations = append(operations, SetOperation{Key: key, Value: value, Options: MetaSetOptions{TTL: expiration}})
 	}
 	results, err := c.batch(ctx, operations)
 	if err != nil {
@@ -234,7 +234,7 @@ func (c *Client) Add(ctx context.Context, key string, value []byte, ttl time.Dur
 	if len(value) == 0 {
 		return false, errEmptyValue
 	}
-	status, err := c.sceneStore(ctx, key, value, SetOptions{TTL: expiration, Mode: ModeAdd})
+	status, err := c.sceneStore(ctx, key, value, MetaSetOptions{TTL: expiration, Mode: ModeAdd})
 	if err != nil {
 		return false, err
 	}
@@ -252,7 +252,7 @@ func (c *Client) Replace(ctx context.Context, key string, value []byte, ttl time
 	if len(value) == 0 {
 		return false, errEmptyValue
 	}
-	status, err := c.sceneStore(ctx, key, value, SetOptions{TTL: expiration, Mode: ModeReplace})
+	status, err := c.sceneStore(ctx, key, value, MetaSetOptions{TTL: expiration, Mode: ModeReplace})
 	if err != nil {
 		return false, err
 	}
@@ -318,7 +318,7 @@ func (c *Client) Update(ctx context.Context, key string, ttl time.Duration, fn f
 			}
 			return nil, errEmptyValue
 		}
-		writeOptions := SetOptions{TTL: expiration}
+		writeOptions := MetaSetOptions{TTL: expiration}
 		if compareCAS != nil {
 			writeOptions.CompareCAS = compareCAS
 		} else {
@@ -338,7 +338,7 @@ func (c *Client) Update(ctx context.Context, key string, ttl time.Duration, fn f
 // Delete removes a key. Deleting an absent key is a success: the goal state
 // already holds.
 func (c *Client) Delete(ctx context.Context, key string) error {
-	command, err := buildDelete(key, DeleteOptions{})
+	command, err := buildDelete(key, MetaDeleteOptions{})
 	if err != nil {
 		return err
 	}
@@ -391,7 +391,7 @@ func (c *Client) Invalidate(ctx context.Context, key string, grace time.Duration
 		return fmt.Errorf("memcache: Invalidate grace must be positive")
 	}
 	staleFor := ExpiresIn(grace)
-	command, err := buildDelete(key, DeleteOptions{Invalidate: true, StaleFor: &staleFor})
+	command, err := buildDelete(key, MetaDeleteOptions{Invalidate: true, StaleFor: &staleFor})
 	if err != nil {
 		return err
 	}
@@ -441,7 +441,7 @@ type ItemInfo struct {
 // bumping its LRU position. It is an observability tool; branching business
 // logic on metadata is not a supported pattern.
 func (c *Client) Inspect(ctx context.Context, key string) (ItemInfo, bool, error) {
-	result, err := c.sceneGet(ctx, key, GetOptions{
+	result, err := c.sceneGet(ctx, key, MetaGetOptions{
 		MetadataOnly:     true,
 		ReturnCAS:        true,
 		ReturnTTL:        true,
@@ -485,7 +485,7 @@ func (c *Client) counter(ctx context.Context, key string, delta uint64, decremen
 	if decrement {
 		initial = 0
 	}
-	arithmetic := ArithmeticOptions{Delta: delta, Decrement: decrement, Initial: &initial, InitialTTL: &expiration}
+	arithmetic := MetaArithmeticOptions{Delta: delta, Decrement: decrement, Initial: &initial, InitialTTL: &expiration}
 	command, err := buildArithmetic(key, arithmetic)
 	if err != nil {
 		return 0, err
@@ -529,7 +529,7 @@ func (c *Client) concat(ctx context.Context, key string, fragment []byte, mode S
 	if len(fragment) == 0 {
 		return errEmptyValue
 	}
-	status, err := c.sceneStore(ctx, key, fragment, SetOptions{Mode: mode, VivifyTTL: &expiration})
+	status, err := c.sceneStore(ctx, key, fragment, MetaSetOptions{Mode: mode, VivifyTTL: &expiration})
 	if err != nil {
 		if c.absorb(ctx, err) {
 			return nil
@@ -586,7 +586,7 @@ func (c *Client) Take(ctx context.Context, key string) ([]byte, error) {
 		if result.Metadata.CAS == nil {
 			return nil, &ProtocolError{Message: "value read omitted requested CAS"}
 		}
-		command, err = buildDelete(key, DeleteOptions{CompareCAS: result.Metadata.CAS})
+		command, err = buildDelete(key, MetaDeleteOptions{CompareCAS: result.Metadata.CAS})
 		if err != nil {
 			return nil, err
 		}

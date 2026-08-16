@@ -181,10 +181,10 @@ Verbs whose answer feeds a business decision (`Add`, `Replace`, `Update`, `Incr`
 Everything not covered by a scenario verb lives behind `Meta()`, a 1:1 mapping of the meta protocol that returns typed results instead of collapsing protocol states into errors.
 
 ```go
-func (m *MetaClient) Get(ctx context.Context, key string, options GetOptions) (GetResult, error)
-func (m *MetaClient) Set(ctx context.Context, key string, value []byte, options SetOptions) (MutationResult, error)
-func (m *MetaClient) Delete(ctx context.Context, key string, options DeleteOptions) (MutationResult, error)
-func (m *MetaClient) Arithmetic(ctx context.Context, key string, options ArithmeticOptions) (ArithmeticResult, error)
+func (m *MetaClient) Get(ctx context.Context, key string, options MetaGetOptions) (GetResult, error)
+func (m *MetaClient) Set(ctx context.Context, key string, value []byte, options MetaSetOptions) (MutationResult, error)
+func (m *MetaClient) Delete(ctx context.Context, key string, options MetaDeleteOptions) (MutationResult, error)
+func (m *MetaClient) Arithmetic(ctx context.Context, key string, options MetaArithmeticOptions) (ArithmeticResult, error)
 func (m *MetaClient) Execute(ctx context.Context, command MetaCommand) (RawResponse, error)
 func (m *MetaClient) Batch(ctx context.Context, operations []Operation) ([]OperationResult, error)
 func (m *MetaClient) Debug(ctx context.Context, key string) (map[string]string, error)
@@ -192,7 +192,7 @@ func (m *MetaClient) Noop(ctx context.Context) error
 ```
 
 ```go
-result, err := mc.Meta().Get(ctx, key, memcache.GetOptions{ReturnCAS: true, ReturnTTL: true})
+result, err := mc.Meta().Get(ctx, key, memcache.MetaGetOptions{ReturnCAS: true, ReturnTTL: true})
 raw, err := mc.Meta().Execute(ctx, memcache.MetaCommand{Command: "mg", Key: key, Flags: []string{"v", "t"}})
 ```
 

@@ -221,7 +221,7 @@ func expirationFlag(prefix string, expiration *Expiration) string {
 	return prefix + strconv.FormatInt(int64(*expiration), 10)
 }
 
-func buildGet(key string, options GetOptions) (MetaCommand, error) {
+func buildGet(key string, options MetaGetOptions) (MetaCommand, error) {
 	if options.UnlessCAS != nil && options.MetadataOnly {
 		return MetaCommand{}, fmt.Errorf("memcache: UnlessCAS requires a value read")
 	}
@@ -281,7 +281,7 @@ func buildGet(key string, options GetOptions) (MetaCommand, error) {
 	return MetaCommand{Command: "mg", Key: key, Flags: flags}, err
 }
 
-func semanticGet(key string, options GetOptions, wire RawResponse) (GetResult, error) {
+func semanticGet(key string, options MetaGetOptions, wire RawResponse) (GetResult, error) {
 	result := GetResult{Key: key, Metadata: wire.Metadata, ValueState: ValueFresh, Lease: LeaseNone, ReturnedKey: wire.Key, Opaque: wire.Opaque}
 	switch wire.Code {
 	case ResponseMiss:
@@ -339,7 +339,7 @@ func modeFlag(mode StoreMode) (string, error) {
 	}
 }
 
-func buildSet(key string, value []byte, options SetOptions) (MetaCommand, error) {
+func buildSet(key string, value []byte, options MetaSetOptions) (MetaCommand, error) {
 	mode, err := modeFlag(options.Mode)
 	if err != nil {
 		return MetaCommand{}, err
@@ -436,7 +436,7 @@ func arithmeticStatus(code ResponseCode) (MutationStatus, error) {
 	}
 }
 
-func buildDelete(key string, options DeleteOptions) (MetaCommand, error) {
+func buildDelete(key string, options MetaDeleteOptions) (MetaCommand, error) {
 	if options.StaleFor != nil && !options.Invalidate {
 		return MetaCommand{}, fmt.Errorf("memcache: StaleFor requires Invalidate")
 	}
@@ -464,7 +464,7 @@ func buildDelete(key string, options DeleteOptions) (MetaCommand, error) {
 	return MetaCommand{Command: "md", Key: key, Flags: flags}, err
 }
 
-func buildArithmetic(key string, options ArithmeticOptions) (MetaCommand, error) {
+func buildArithmetic(key string, options MetaArithmeticOptions) (MetaCommand, error) {
 	if (options.Initial == nil) != (options.InitialTTL == nil) {
 		return MetaCommand{}, fmt.Errorf("memcache: Initial and InitialTTL must be supplied together")
 	}
@@ -504,7 +504,7 @@ func buildArithmetic(key string, options ArithmeticOptions) (MetaCommand, error)
 	return MetaCommand{Command: "ma", Key: key, Flags: flags}, err
 }
 
-func semanticArithmetic(key string, options ArithmeticOptions, wire RawResponse) (ArithmeticResult, error) {
+func semanticArithmetic(key string, options MetaArithmeticOptions, wire RawResponse) (ArithmeticResult, error) {
 	status, err := arithmeticStatus(wire.Code)
 	result := ArithmeticResult{Key: key, Status: status, Metadata: wire.Metadata, ReturnedKey: wire.Key, Opaque: wire.Opaque}
 	if err == nil && status == MutationApplied {

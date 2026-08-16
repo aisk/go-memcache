@@ -26,7 +26,7 @@ const (
 // GetOperation is a batch meta get.
 type GetOperation struct {
 	Key     string
-	Options GetOptions
+	Options MetaGetOptions
 }
 
 func (o GetOperation) operationKey() string { return o.Key }
@@ -39,7 +39,7 @@ func (o GetOperation) prepare() (MetaCommand, operationKind, error) {
 type SetOperation struct {
 	Key     string
 	Value   []byte
-	Options SetOptions
+	Options MetaSetOptions
 }
 
 func (o SetOperation) operationKey() string { return o.Key }
@@ -51,7 +51,7 @@ func (o SetOperation) prepare() (MetaCommand, operationKind, error) {
 // DeleteOperation is a batch meta delete.
 type DeleteOperation struct {
 	Key     string
-	Options DeleteOptions
+	Options MetaDeleteOptions
 }
 
 func (o DeleteOperation) operationKey() string { return o.Key }
@@ -63,7 +63,7 @@ func (o DeleteOperation) prepare() (MetaCommand, operationKind, error) {
 // ArithmeticOperation is a batch meta arithmetic command.
 type ArithmeticOperation struct {
 	Key     string
-	Options ArithmeticOptions
+	Options MetaArithmeticOptions
 }
 
 func (o ArithmeticOperation) operationKey() string { return o.Key }
