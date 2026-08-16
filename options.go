@@ -81,16 +81,18 @@ type FetchOption interface{ applyFetch(*callPolicy) }
 // the parameter exists so future options need no signature change.
 type UpdateOption interface{ applyUpdate(*callPolicy) }
 
-// CounterOption modifies an Incr or Decr call.
+// CounterOption modifies an Incr or Decr call. No shipped option currently
+// applies; the parameter exists so future options need no signature change.
 type CounterOption interface{ applyCounter(*callPolicy) }
 
-// StreamOption modifies an Append or Prepend call.
-type StreamOption interface{ applyStream(*callPolicy) }
+// AppendOption modifies an Append or Prepend call. No shipped option
+// currently applies; the parameter exists so future options need no
+// signature change.
+type AppendOption interface{ applyAppend(*callPolicy) }
 
 // callPolicy resolves per-call options against New-level policy defaults.
 type callPolicy struct {
 	refreshAhead *time.Duration
-	window       *time.Duration
 }
 
 func (c *config) callPolicy() callPolicy {
@@ -103,25 +105,14 @@ func (c *config) callPolicy() callPolicy {
 const Forever time.Duration = 0
 
 // resolveTTL validates a positional TTL. Zero (Forever) stores without
-// expiration; a negative duration is always a mistake.
+// expiration; a negative duration is always a mistake. On Incr, Decr,
+// Append, and Prepend the TTL applies only when the call auto-creates the
+// key; it never extends an existing key's lifetime.
 func resolveTTL(ttl time.Duration) (Expiration, error) {
 	if ttl < 0 {
 		return 0, fmt.Errorf("memcache: TTL must not be negative")
 	}
 	return ExpiresIn(ttl), nil
-}
-
-// resolveWindow enforces the no-silent-default rule for the counter and
-// byte-stream creation window. Auto-creation on miss needs the window's TTL on
-// the wire, so there is nothing sensible to fall back to.
-func (p *callPolicy) resolveWindow() (Expiration, error) {
-	if p.window == nil {
-		return 0, fmt.Errorf("memcache: no Window configured: pass memcache.Window at the call site")
-	}
-	if *p.window <= 0 {
-		return 0, fmt.Errorf("memcache: Window must be positive")
-	}
-	return ExpiresIn(*p.window), nil
 }
 
 type refreshAheadOption time.Duration
@@ -146,23 +137,6 @@ func RefreshAhead(d time.Duration) interface {
 	return refreshAheadOption(d)
 }
 
-type windowOption time.Duration
-
-func (o windowOption) applyCounter(p *callPolicy) { p.window = ptr(time.Duration(o)) }
-func (o windowOption) applyStream(p *callPolicy)  { p.window = ptr(time.Duration(o)) }
-
-// Window sets the TTL used when a counter or byte-stream key is auto-created
-// on miss. It stays a named option rather than a positional duration because
-// it is not a TTL: it applies only at creation, and later increments and
-// appends never extend it, which is exactly fixed-window rate limiting and
-// rolling event collection. Every counter and stream call must carry one.
-func Window(d time.Duration) interface {
-	CounterOption
-	StreamOption
-} {
-	return windowOption(d)
-}
-
 type degradeOption bool
 
 func (o degradeOption) applyOption(c *config) error { c.degrade = bool(o); return nil }
@@ -171,7 +145,7 @@ func (o degradeOption) policyOption()               {}
 // Degrade selects the failure policy for the whole client. When enabled,
 // reads report an infrastructure failure as a miss and unconditional writes
 // give up silently; every absorbed error still reaches OnError. Verbs whose
-// answer feeds a business decision (Add, Replace, Update, Incr, Decr, Drain)
+// answer feeds a business decision (Add, Replace, Update, Incr, Decr, Take)
 // keep returning errors, and an AmbiguousWriteError is never absorbed.
 // The default is to return every error.
 func Degrade(on bool) PolicyOption { return degradeOption(on) }

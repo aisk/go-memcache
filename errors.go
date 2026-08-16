@@ -14,7 +14,7 @@ var (
 	ErrClosed = errors.New("memcache: client is closed")
 	// ErrNotStored means a conditional mutation was not applied.
 	ErrNotStored = errors.New("memcache: value not stored")
-	// ErrConflict is returned by Update and Drain when their optimistic
+	// ErrConflict is returned by Update and Take when their optimistic
 	// retry loop keeps losing to concurrent writers.
 	ErrConflict = errors.New("memcache: too many conflicting concurrent writes")
 )

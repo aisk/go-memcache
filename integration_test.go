@@ -376,57 +376,57 @@ func TestIntegrationCounters(t *testing.T) {
 	c := integrationClient(t)
 	ctx := context.Background()
 
-	if _, err := c.Incr(ctx, "rate", 1); err == nil || !strings.Contains(err.Error(), "no Window") {
-		t.Fatalf("incr without window: %v", err)
+	if _, err := c.Incr(ctx, "rate", 1, -time.Second); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("incr with a negative ttl: %v", err)
 	}
-	n, err := c.Incr(ctx, "rate", 1, Window(time.Minute))
+	n, err := c.Incr(ctx, "rate", 1, time.Minute)
 	if err != nil || n != 1 {
 		t.Fatalf("first increment = %d, %v", n, err)
 	}
-	n, err = c.Incr(ctx, "rate", 4, Window(time.Minute))
+	n, err = c.Incr(ctx, "rate", 4, time.Minute)
 	if err != nil || n != 5 {
 		t.Fatalf("second increment = %d, %v", n, err)
 	}
-	n, err = c.Decr(ctx, "rate", 100, Window(time.Minute))
+	n, err = c.Decr(ctx, "rate", 100, time.Minute)
 	if err != nil || n != 0 {
 		t.Fatalf("decrement did not saturate: %d, %v", n, err)
 	}
-	n, err = c.Decr(ctx, "fresh-floor", 3, Window(time.Minute))
+	n, err = c.Decr(ctx, "fresh-floor", 3, time.Minute)
 	if err != nil || n != 0 {
 		t.Fatalf("decrement on miss = %d, %v", n, err)
 	}
 }
 
-func TestIntegrationEventBuffer(t *testing.T) {
+func TestIntegrationAppendTake(t *testing.T) {
 	c := integrationClient(t)
 	ctx := context.Background()
 
-	if err := c.Append(ctx, "events", []byte("login;")); err == nil || !strings.Contains(err.Error(), "no Window") {
-		t.Fatalf("append without window: %v", err)
+	if err := c.Append(ctx, "events", []byte("login;"), -time.Second); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("append with a negative ttl: %v", err)
 	}
-	if err := c.Append(ctx, "events", []byte("login;"), Window(time.Hour)); err != nil {
+	if err := c.Append(ctx, "events", []byte("login;"), time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Append(ctx, "events", []byte("click;"), Window(time.Hour)); err != nil {
+	if err := c.Append(ctx, "events", []byte("click;"), time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepend(ctx, "events", []byte("boot;"), Window(time.Hour)); err != nil {
+	if err := c.Prepend(ctx, "events", []byte("boot;"), time.Hour); err != nil {
 		t.Fatal(err)
 	}
 
-	peeked, ok, err := c.Peek(ctx, "events")
-	if err != nil || !ok || string(peeked) != "boot;login;click;" {
-		t.Fatalf("peek: %q ok=%v err=%v", peeked, ok, err)
+	got, ok, err := c.Get(ctx, "events")
+	if err != nil || !ok || string(got) != "boot;login;click;" {
+		t.Fatalf("get: %q ok=%v err=%v", got, ok, err)
 	}
-	drained, err := c.Drain(ctx, "events")
-	if err != nil || string(drained) != "boot;login;click;" {
-		t.Fatalf("drain: %q, %v", drained, err)
+	taken, err := c.Take(ctx, "events")
+	if err != nil || string(taken) != "boot;login;click;" {
+		t.Fatalf("take: %q, %v", taken, err)
 	}
-	if drained, err = c.Drain(ctx, "events"); err != nil || drained != nil {
-		t.Fatalf("drain empty: %q, %v", drained, err)
+	if taken, err = c.Take(ctx, "events"); err != nil || taken != nil {
+		t.Fatalf("take empty: %q, %v", taken, err)
 	}
-	if _, ok, _ := c.Peek(ctx, "events"); ok {
-		t.Fatal("drain left data behind")
+	if _, ok, _ := c.Get(ctx, "events"); ok {
+		t.Fatal("take left data behind")
 	}
 }
 
@@ -563,8 +563,8 @@ func TestIntegrationZeroByteValueReadsAsMiss(t *testing.T) {
 	if _, ok, err := c.Get(ctx, "empty"); err != nil || ok {
 		t.Fatalf("zero-byte get: ok=%v err=%v", ok, err)
 	}
-	if _, ok, err := c.Peek(ctx, "empty"); err != nil || ok {
-		t.Fatalf("zero-byte peek: ok=%v err=%v", ok, err)
+	if v, err := c.Take(ctx, "empty"); err != nil || v != nil {
+		t.Fatalf("zero-byte take: %q, %v", v, err)
 	}
 	// Update's read step folds it too, and its conditional write can still
 	// replace the placeholder without an add/exists livelock.
@@ -657,12 +657,12 @@ func TestIntegrationUpdateConflictExhaustsRetries(t *testing.T) {
 	}
 }
 
-// Drain retries when an append slips in between its read and its conditional
-// delete, so no event is ever lost in the gap.
-func TestIntegrationDrainLosesNoEvents(t *testing.T) {
+// Take retries when an append slips in between its read and its conditional
+// delete, so no appended bytes are ever lost in the gap.
+func TestIntegrationTakeLosesNoAppends(t *testing.T) {
 	c := integrationClient(t)
 	ctx := context.Background()
-	if err := c.Append(ctx, "stream", []byte("a;"), Window(time.Hour)); err != nil {
+	if err := c.Append(ctx, "acc", []byte("a;"), time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	const appenders = 8
@@ -671,29 +671,29 @@ func TestIntegrationDrainLosesNoEvents(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = c.Append(ctx, "stream", []byte("x;"), Window(time.Hour))
+			_ = c.Append(ctx, "acc", []byte("x;"), time.Hour)
 		}()
 	}
-	var drained []byte
+	var taken []byte
 	for {
-		part, err := c.Drain(ctx, "stream")
+		part, err := c.Take(ctx, "acc")
 		if err != nil {
 			t.Fatal(err)
 		}
 		if part == nil {
 			break
 		}
-		drained = append(drained, part...)
+		taken = append(taken, part...)
 	}
 	wg.Wait()
-	// Collect stragglers that appended after the last drain returned nil.
-	rest, err := c.Drain(ctx, "stream")
+	// Collect stragglers that appended after the last take returned nil.
+	rest, err := c.Take(ctx, "acc")
 	if err != nil {
 		t.Fatal(err)
 	}
-	drained = append(drained, rest...)
-	if got := strings.Count(string(drained), ";"); got != appenders+1 {
-		t.Fatalf("drained %d events, want %d: %q", got, appenders+1, drained)
+	taken = append(taken, rest...)
+	if got := strings.Count(string(taken), ";"); got != appenders+1 {
+		t.Fatalf("took %d fragments, want %d: %q", got, appenders+1, taken)
 	}
 }
 

@@ -29,7 +29,9 @@ err = mc.Set(ctx, "user:42", buf, 10*time.Minute)
 err = mc.Set(ctx, "config:site", buf, memcache.Forever)
 ```
 
-可选修饰按动词做了类型约束：`RefreshAhead` 只被 `Fetch` 接受，`Window` 只被计数器和流接受。把选项用在没有意义的动词上是编译错误，而不是运行时意外。
+在 `Incr`/`Decr`/`Append`/`Prepend` 上，TTL 只在本次调用自动创建 key 时生效，永远不会延长已存在的 key 的生存期。
+
+可选修饰按动词做了类型约束：`RefreshAhead` 只被 `Fetch` 接受。把选项用在没有意义的动词上是编译错误，而不是运行时意外。
 
 ## 获取或计算：Fetch
 
@@ -49,7 +51,7 @@ feed, err := mc.Fetch(ctx, "home:"+uid, 5*time.Minute, buildFeed,
 
 `Invalidate(ctx, key, grace)` 把值标记为陈旧而不是删除。宽限期内读取方继续拿到旧副本，同时 `Fetch` 选出一个调用者在后台刷新。`Delete` 是硬删除的变体。所有写回都以选举时观察到的版本为条件，因此重算过程中被删除的键永远不会复活。
 
-## 并发修改：Update 和 Drain
+## 并发修改：Update 和 Take
 
 `Update` 在内部执行「读、变换、条件写、重试」循环，版本令牌永远不会出现在用户代码中：
 
@@ -67,15 +69,15 @@ cart, err := mc.Update(ctx, "cart:"+uid, 30*time.Minute,
 )
 ```
 
-`Drain` 原子地取走并清空由 `Append`/`Prepend` 构建的字节流缓冲区，不存在并发追加的事件丢失的窗口。`Incr`/`Decr` 在固定的 `Window` 内自动创建计数器，这正是固定窗口限流：
+`Append`/`Prepend` 把原始字节拼接到一个值上，`Take` 原子地读出并删除它，不存在并发追加的字节丢失的窗口。库只提供这个机制，字节如何组织、攒起来做什么用由调用方决定。`Incr`/`Decr` 自动创建计数器时以创建时刻的 TTL 为准，后续递增不再延长它，这正是固定窗口限流：
 
 ```go
-n, err := mc.Incr(ctx, "rate:"+ip, 1, memcache.Window(time.Minute))
+n, err := mc.Incr(ctx, "rate:"+ip, 1, time.Minute)
 ```
 
 ## 失败策略
 
-默认情况下每个基础设施失败都以错误形式暴露。`Degrade(true)` 让读操作把失败报告为未命中，无条件写操作静默放弃，因为缓存故障不应该变成站点故障。每个被吸收的错误仍会到达 `OnError` 钩子。答案会影响业务决策的动词（`Add`、`Replace`、`Update`、`Incr`、`Decr`、`Drain`）依然大声失败，`AmbiguousWriteError`（写入可能已落地）也总是会暴露。
+默认情况下每个基础设施失败都以错误形式暴露。`Degrade(true)` 让读操作把失败报告为未命中，无条件写操作静默放弃，因为缓存故障不应该变成站点故障。每个被吸收的错误仍会到达 `OnError` 钩子。答案会影响业务决策的动词（`Add`、`Replace`、`Update`、`Incr`、`Decr`、`Take`）依然大声失败，`AmbiguousWriteError`（写入可能已落地）也总是会暴露。
 
 ```go
 mc, err := memcache.NewServers(servers,

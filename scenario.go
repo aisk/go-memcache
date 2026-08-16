@@ -316,7 +316,7 @@ func (c *Client) Replace(ctx context.Context, key string, value []byte, ttl time
 	return status == MutationApplied, nil
 }
 
-// updateAttempts bounds the optimistic concurrency loops in Update and Drain.
+// updateAttempts bounds the optimistic concurrency loops in Update and Take.
 const updateAttempts = 8
 
 // Update atomically transforms a value and stores the result for ttl: read
@@ -544,7 +544,7 @@ func (c *Client) Inspect(ctx context.Context, key string) (ItemInfo, bool, error
 }
 
 // counter is the shared implementation of Incr and Decr.
-func (c *Client) counter(ctx context.Context, key string, delta uint64, decrement bool, options []CounterOption) (uint64, error) {
+func (c *Client) counter(ctx context.Context, key string, delta uint64, decrement bool, ttl time.Duration, options []CounterOption) (uint64, error) {
 	policy := c.config.callPolicy()
 	for _, option := range options {
 		if option == nil {
@@ -552,7 +552,7 @@ func (c *Client) counter(ctx context.Context, key string, delta uint64, decremen
 		}
 		option.applyCounter(&policy)
 	}
-	window, err := policy.resolveWindow()
+	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return 0, err
 	}
@@ -563,7 +563,7 @@ func (c *Client) counter(ctx context.Context, key string, delta uint64, decremen
 	if decrement {
 		initial = 0
 	}
-	arithmetic := ArithmeticOptions{Delta: delta, Decrement: decrement, Initial: &initial, InitialTTL: &window}
+	arithmetic := ArithmeticOptions{Delta: delta, Decrement: decrement, Initial: &initial, InitialTTL: &expiration}
 	command, err := buildArithmetic(key, arithmetic)
 	if err != nil {
 		return 0, err
@@ -582,37 +582,39 @@ func (c *Client) counter(ctx context.Context, key string, delta uint64, decremen
 	return result.Value, nil
 }
 
-// Incr adds delta to a decimal counter, creating it inside the resolved
-// Window on a miss so the first request counts as delta. The window is fixed
-// at creation; later increments never extend it. The result feeds business
-// decisions, so Degrade never fakes one: infrastructure failures surface.
-func (c *Client) Incr(ctx context.Context, key string, delta uint64, options ...CounterOption) (uint64, error) {
-	return c.counter(ctx, key, delta, false, options)
+// Incr adds delta to a decimal counter, creating it with ttl on a miss so
+// the first request counts as delta. The ttl applies only at creation; later
+// increments never extend an existing counter's lifetime, which is exactly
+// what fixed-window counting needs. The result feeds business decisions, so
+// Degrade never fakes one: infrastructure failures surface.
+func (c *Client) Incr(ctx context.Context, key string, delta uint64, ttl time.Duration, options ...CounterOption) (uint64, error) {
+	return c.counter(ctx, key, delta, false, ttl, options)
 }
 
 // Decr subtracts delta from a decimal counter, saturating at zero. A miss
-// creates the counter at zero inside the resolved Window.
-func (c *Client) Decr(ctx context.Context, key string, delta uint64, options ...CounterOption) (uint64, error) {
-	return c.counter(ctx, key, delta, true, options)
+// creates the counter at zero with ttl; as with Incr, the ttl applies only
+// at creation.
+func (c *Client) Decr(ctx context.Context, key string, delta uint64, ttl time.Duration, options ...CounterOption) (uint64, error) {
+	return c.counter(ctx, key, delta, true, ttl, options)
 }
 
-// stream is the shared implementation of Append and Prepend.
-func (c *Client) stream(ctx context.Context, key string, fragment []byte, mode StoreMode, options []StreamOption) error {
+// concat is the shared implementation of Append and Prepend.
+func (c *Client) concat(ctx context.Context, key string, fragment []byte, mode StoreMode, ttl time.Duration, options []AppendOption) error {
 	policy := c.config.callPolicy()
 	for _, option := range options {
 		if option == nil {
 			return errNilOption
 		}
-		option.applyStream(&policy)
+		option.applyAppend(&policy)
 	}
-	window, err := policy.resolveWindow()
+	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return err
 	}
 	if len(fragment) == 0 {
 		return errEmptyValue
 	}
-	status, err := c.sceneStore(ctx, key, fragment, SetOptions{Mode: mode, VivifyTTL: &window})
+	status, err := c.sceneStore(ctx, key, fragment, SetOptions{Mode: mode, VivifyTTL: &expiration})
 	if err != nil {
 		if c.absorb(ctx, err) {
 			return nil
@@ -625,38 +627,27 @@ func (c *Client) stream(ctx context.Context, key string, fragment []byte, mode S
 	return nil
 }
 
-// Append adds a fragment to the end of a byte-stream buffer, creating the
-// buffer inside the resolved Window on a miss. Fragments bypass any value
-// encoding: the buffer is raw bytes by design.
-func (c *Client) Append(ctx context.Context, key string, fragment []byte, options ...StreamOption) error {
-	return c.stream(ctx, key, fragment, ModeAppend, options)
+// Append adds a fragment to the end of a raw bytes value, creating the value
+// with ttl on a miss. The ttl applies only at creation; later appends never
+// extend an existing value's lifetime. Fragments bypass any value encoding;
+// how the accumulated bytes are structured is the caller's business.
+func (c *Client) Append(ctx context.Context, key string, fragment []byte, ttl time.Duration, options ...AppendOption) error {
+	return c.concat(ctx, key, fragment, ModeAppend, ttl, options)
 }
 
-// Prepend adds a fragment to the front of a byte-stream buffer, creating the
-// buffer inside the resolved Window on a miss.
-func (c *Client) Prepend(ctx context.Context, key string, fragment []byte, options ...StreamOption) error {
-	return c.stream(ctx, key, fragment, ModePrepend, options)
+// Prepend adds a fragment to the front of a raw bytes value, creating the
+// value with ttl on a miss; as with Append, the ttl applies only at creation.
+func (c *Client) Prepend(ctx context.Context, key string, fragment []byte, ttl time.Duration, options ...AppendOption) error {
+	return c.concat(ctx, key, fragment, ModePrepend, ttl, options)
 }
 
-// Peek reads a byte-stream buffer without clearing it.
-func (c *Client) Peek(ctx context.Context, key string) ([]byte, bool, error) {
-	result, err := c.sceneGet(ctx, key, sceneReadOptions())
-	if err != nil {
-		return nil, false, err
-	}
-	if result.Status != GetHit || len(result.Value) == 0 {
-		return nil, false, nil
-	}
-	return result.Value, true, nil
-}
-
-// Drain atomically takes a byte-stream buffer and clears it: read with
-// version, delete only if unchanged, retry when a concurrent append slipped
-// in between. There is no window in which appended events can be lost. A nil
-// result means the buffer was empty; a miss and an empty buffer are
-// deliberately the same answer. Drained data feeds a consumer, so Degrade
-// never absorbs failures here.
-func (c *Client) Drain(ctx context.Context, key string) ([]byte, error) {
+// Take atomically reads a value and deletes it: read with version, delete
+// only if unchanged, retry when a concurrent write slipped in between. Bytes
+// appended between the read and the delete are never lost. A nil result
+// means there was nothing to take; a miss and an empty value are
+// deliberately the same answer. The result feeds the caller's next step, so
+// Degrade never absorbs failures here.
+func (c *Client) Take(ctx context.Context, key string) ([]byte, error) {
 	readOptions := sceneReadOptions()
 	for range updateAttempts {
 		command, err := buildGet(key, readOptions)
@@ -695,8 +686,8 @@ func (c *Client) Drain(ctx context.Context, key string) ([]byte, error) {
 		if status == MutationApplied {
 			return result.Value, nil
 		}
-		// A CAS mismatch means new events arrived after the read; a vanished
-		// key means someone else cleared it. Either way, read again.
+		// A CAS mismatch means the value changed after the read; a vanished
+		// key means someone else deleted it. Either way, read again.
 	}
 	return nil, ErrConflict
 }

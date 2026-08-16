@@ -15,9 +15,6 @@ var (
 	_ PolicyOption = RefreshAhead(time.Second)
 	_ FetchOption  = RefreshAhead(time.Second)
 
-	_ CounterOption = Window(time.Second)
-	_ StreamOption  = Window(time.Second)
-
 	_ PolicyOption = Degrade(true)
 	_ PolicyOption = OnError(func(error) {})
 
@@ -27,14 +24,6 @@ var (
 func TestEngineOptionsAreNotPolicyOptions(t *testing.T) {
 	if _, ok := any(WithTimeout(time.Second)).(PolicyOption); ok {
 		t.Fatal("an engine option must not double as a policy default")
-	}
-}
-
-// Window is deliberately not a client-wide default: auto-creation semantics
-// must be visible at every counter and stream call site.
-func TestWindowIsNotAPolicyOption(t *testing.T) {
-	if _, ok := any(Window(time.Second)).(PolicyOption); ok {
-		t.Fatal("Window must not double as a policy default")
 	}
 }
 
@@ -61,15 +50,15 @@ func TestPolicyResolutionErrors(t *testing.T) {
 			t.Errorf("%s with a negative TTL: %v", name, err)
 		}
 	}
-	needWindow := map[string]func() error{
-		"Incr":    func() error { _, err := client.Incr(ctx, "k", 1); return err },
-		"Decr":    func() error { _, err := client.Decr(ctx, "k", 1); return err },
-		"Append":  func() error { return client.Append(ctx, "k", []byte("v")) },
-		"Prepend": func() error { return client.Prepend(ctx, "k", []byte("v")) },
+	negativeCreateTTL := map[string]func() error{
+		"Incr":    func() error { _, err := client.Incr(ctx, "k", 1, -time.Second); return err },
+		"Decr":    func() error { _, err := client.Decr(ctx, "k", 1, -time.Second); return err },
+		"Append":  func() error { return client.Append(ctx, "k", []byte("v"), -time.Second) },
+		"Prepend": func() error { return client.Prepend(ctx, "k", []byte("v"), -time.Second) },
 	}
-	for name, call := range needWindow {
-		if err := call(); err == nil || !strings.Contains(err.Error(), "no Window") {
-			t.Errorf("%s without Window: %v", name, err)
+	for name, call := range negativeCreateTTL {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "negative") {
+			t.Errorf("%s with a negative TTL: %v", name, err)
 		}
 	}
 }
@@ -96,8 +85,8 @@ func TestEmptyValuesAreRejectedByWrites(t *testing.T) {
 		"SetMany": func() error { return client.SetMany(ctx, map[string][]byte{"k": {}}, time.Minute) },
 		"Add":     func() error { _, err := client.Add(ctx, "k", nil, time.Minute); return err },
 		"Replace": func() error { _, err := client.Replace(ctx, "k", nil, time.Minute); return err },
-		"Append":  func() error { return client.Append(ctx, "k", nil, Window(time.Minute)) },
-		"Prepend": func() error { return client.Prepend(ctx, "k", nil, Window(time.Minute)) },
+		"Append":  func() error { return client.Append(ctx, "k", nil, time.Minute) },
+		"Prepend": func() error { return client.Prepend(ctx, "k", nil, time.Minute) },
 	}
 	for name, call := range writes {
 		if err := call(); err == nil || !strings.Contains(err.Error(), "empty") {
@@ -197,9 +186,6 @@ func TestDegradePolicyAgainstDeadBackend(t *testing.T) {
 	if _, ok, err := client.Inspect(ctx, "k"); err != nil || ok {
 		t.Fatalf("degraded inspect: ok=%v err=%v", ok, err)
 	}
-	if _, ok, err := client.Peek(ctx, "k"); err != nil || ok {
-		t.Fatalf("degraded peek: ok=%v err=%v", ok, err)
-	}
 
 	// Unconditional writes give up silently.
 	silent := map[string]func() error{
@@ -209,8 +195,8 @@ func TestDegradePolicyAgainstDeadBackend(t *testing.T) {
 		"DeleteMany": func() error { return client.DeleteMany(ctx, []string{"k"}) },
 		"Invalidate": func() error { return client.Invalidate(ctx, "k", time.Minute) },
 		"Touch":      func() error { return client.Touch(ctx, "k", time.Minute) },
-		"Append":     func() error { return client.Append(ctx, "k", []byte("v"), Window(time.Minute)) },
-		"Prepend":    func() error { return client.Prepend(ctx, "k", []byte("v"), Window(time.Minute)) },
+		"Append":     func() error { return client.Append(ctx, "k", []byte("v"), time.Minute) },
+		"Prepend":    func() error { return client.Prepend(ctx, "k", []byte("v"), time.Minute) },
 	}
 	for name, call := range silent {
 		if err := call(); err != nil {
@@ -222,9 +208,9 @@ func TestDegradePolicyAgainstDeadBackend(t *testing.T) {
 	loud := map[string]func() error{
 		"Add":     func() error { _, err := client.Add(ctx, "k", []byte("v"), time.Minute); return err },
 		"Replace": func() error { _, err := client.Replace(ctx, "k", []byte("v"), time.Minute); return err },
-		"Incr":    func() error { _, err := client.Incr(ctx, "k", 1, Window(time.Minute)); return err },
-		"Decr":    func() error { _, err := client.Decr(ctx, "k", 1, Window(time.Minute)); return err },
-		"Drain":   func() error { _, err := client.Drain(ctx, "k"); return err },
+		"Incr":    func() error { _, err := client.Incr(ctx, "k", 1, time.Minute); return err },
+		"Decr":    func() error { _, err := client.Decr(ctx, "k", 1, time.Minute); return err },
+		"Take":    func() error { _, err := client.Take(ctx, "k"); return err },
 		"Update": func() error {
 			_, err := client.Update(ctx, "k", time.Minute, func([]byte, bool) ([]byte, error) { return []byte("v"), nil })
 			return err

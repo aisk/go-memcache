@@ -29,7 +29,9 @@ Every operation that stores a value takes its TTL as a positional parameter, mat
 err = mc.Set(ctx, "config:site", buf, memcache.Forever)
 ```
 
-Optional modifiers are typed per verb: `RefreshAhead` is accepted only by `Fetch`; `Window` only by counters and streams. Putting an option on a verb it has no meaning for is a compile error, not a runtime surprise.
+On `Incr`/`Decr`/`Append`/`Prepend` the TTL applies only when the call auto-creates the key; it never extends an existing key's lifetime.
+
+Optional modifiers are typed per verb: `RefreshAhead` is accepted only by `Fetch`. Putting an option on a verb it has no meaning for is a compile error, not a runtime surprise.
 
 ## Get or compute: Fetch
 
@@ -49,7 +51,7 @@ feed, err := mc.Fetch(ctx, "home:"+uid, 5*time.Minute, buildFeed,
 
 `Invalidate(ctx, key, grace)` marks a value stale instead of deleting it: readers keep the old copy for the grace period while `Fetch` elects one caller to refresh in the background. `Delete` is the hard variant. All write-backs are conditional on the version observed at election, so a key deleted mid-recompute is never resurrected.
 
-## Concurrent modification: Update and Drain
+## Concurrent modification: Update and Take
 
 `Update` runs the read-transform-conditional-write-retry loop internally; version tokens never appear in user code:
 
@@ -67,15 +69,15 @@ cart, err := mc.Update(ctx, "cart:"+uid, 30*time.Minute,
 )
 ```
 
-`Drain` atomically takes and clears a byte-stream buffer built with `Append`/`Prepend`, with no window in which concurrently appended events can be lost. `Incr`/`Decr` auto-create counters inside a fixed `Window`, which is exactly fixed-window rate limiting:
+`Append`/`Prepend` concatenate raw bytes onto a value, and `Take` atomically reads it and deletes it, with no window in which concurrently appended bytes can be lost. The library stops at the mechanism; how the bytes are structured and what they are collected for is the caller's business. `Incr`/`Decr` auto-create counters with the TTL fixed at creation, and later increments never extend it, which is exactly fixed-window rate limiting:
 
 ```go
-n, err := mc.Incr(ctx, "rate:"+ip, 1, memcache.Window(time.Minute))
+n, err := mc.Incr(ctx, "rate:"+ip, 1, time.Minute)
 ```
 
 ## Failure policy
 
-By default every infrastructure failure surfaces as an error. `Degrade(true)` makes reads report failures as misses and unconditional writes give up silently, because a cache outage should not be a site outage; every absorbed error still reaches the `OnError` hook. Verbs whose answer feeds a business decision (`Add`, `Replace`, `Update`, `Incr`, `Decr`, `Drain`) keep failing loudly, and an `AmbiguousWriteError` (the write may have landed) always surfaces.
+By default every infrastructure failure surfaces as an error. `Degrade(true)` makes reads report failures as misses and unconditional writes give up silently, because a cache outage should not be a site outage; every absorbed error still reaches the `OnError` hook. Verbs whose answer feeds a business decision (`Add`, `Replace`, `Update`, `Incr`, `Decr`, `Take`) keep failing loudly, and an `AmbiguousWriteError` (the write may have landed) always surfaces.
 
 ```go
 mc, err := memcache.NewServers(servers,
