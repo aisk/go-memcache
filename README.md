@@ -20,33 +20,29 @@ raw, ok, err := mc.Get(ctx, "user:42")   // value, presence, failure: three axes
 if err != nil { /* infrastructure failure */ }
 if !ok { /* miss: recompute and store */ }
 
-err = mc.Set(ctx, "user:42", buf, memcache.TTL(10*time.Minute))
+err = mc.Set(ctx, "user:42", buf, 10*time.Minute)
 ```
 
-Operations that need a TTL resolve it from the call site first, then from a client-wide default declared at `New`; if neither exists they fail. Storing without expiration requires an explicit `TTL(0)`.
+Every operation that stores a value takes its TTL as a positional parameter, matching the go-redis convention. There is no client-wide default TTL: a call site always shows how long its data lives, and storing without expiration is the explicit choice `memcache.Forever`.
 
 ```go
-mc, err := memcache.New("127.0.0.1:11211",
-    memcache.WithTimeout(time.Second),  // engine option
-    memcache.TTL(5*time.Minute),        // policy options double as client-wide defaults
-)
+err = mc.Set(ctx, "config:site", buf, memcache.Forever)
 ```
 
-Options are typed per verb: `TTL` is accepted by writes, `Fetch`, `Update`, and `GetTouch`; `RefreshAhead` only by `Fetch`; `Window` only by counters and streams. Putting an option on a verb it has no meaning for is a compile error, not a runtime surprise.
+Optional modifiers are typed per verb: `RefreshAhead` is accepted only by `Fetch`; `Window` only by counters and streams. Putting an option on a verb it has no meaning for is a compile error, not a runtime surprise.
 
 ## Get or compute: Fetch
 
 `Fetch` is the highest-frequency cache scenario as one verb: return the cached value, or compute it exactly once.
 
 ```go
-report, err := mc.Fetch(ctx, "report:q3", buildReport, memcache.TTL(time.Hour))
+report, err := mc.Fetch(ctx, "report:q3", time.Hour, buildReport)
 ```
 
 On a miss, one caller across all processes wins a server-side lease (meta vivify) and runs the loader; other goroutines in the same process wait on that result, other processes wait briefly and then compute locally without writing back. With `RefreshAhead`, a value nearing expiry is served immediately while one elected caller recomputes in a background goroutine, so no request ever pays the recompute latency:
 
 ```go
-feed, err := mc.Fetch(ctx, "home:"+uid, buildFeed,
-    memcache.TTL(5*time.Minute),
+feed, err := mc.Fetch(ctx, "home:"+uid, 5*time.Minute, buildFeed,
     memcache.RefreshAhead(30*time.Second),
 )
 ```
@@ -58,7 +54,7 @@ feed, err := mc.Fetch(ctx, "home:"+uid, buildFeed,
 `Update` runs the read-transform-conditional-write-retry loop internally; version tokens never appear in user code:
 
 ```go
-cart, err := mc.Update(ctx, "cart:"+uid,
+cart, err := mc.Update(ctx, "cart:"+uid, 30*time.Minute,
     func(current []byte, found bool) ([]byte, error) {
         var items []Item
         if found {
@@ -68,7 +64,6 @@ cart, err := mc.Update(ctx, "cart:"+uid,
         }
         return json.Marshal(append(items, item))
     },
-    memcache.TTL(30*time.Minute),
 )
 ```
 

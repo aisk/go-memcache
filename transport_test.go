@@ -60,7 +60,7 @@ func TestCanceledMutationIsAmbiguous(t *testing.T) {
 	client, _ := New("pipe", WithDialer(dial), WithTimeout(0))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- client.Set(ctx, "key", []byte("x"), TTL(0)) }()
+	go func() { done <- client.Set(ctx, "key", []byte("x"), Forever) }()
 	<-requestRead
 	cancel()
 	err := <-done
@@ -90,7 +90,7 @@ func TestPartialCommandWriteIsNotAmbiguous(t *testing.T) {
 		return &partialWriteConn{Conn: client, limit: 1}, nil
 	}
 	client, _ := New("pipe", WithDialer(dial))
-	err := client.Set(context.Background(), "key", []byte("value"), TTL(0))
+	err := client.Set(context.Background(), "key", []byte("value"), Forever)
 	var ambiguous *AmbiguousWriteError
 	if err == nil || errors.As(err, &ambiguous) {
 		t.Fatalf("got %T %v", err, err)
@@ -163,7 +163,7 @@ func TestFramedFlagErrorIsKnownAndConnectionReusable(t *testing.T) {
 		return client, nil
 	}
 	client, _ := New("pipe", WithDialer(dial))
-	err := client.Set(context.Background(), "one", []byte("x"), TTL(0))
+	err := client.Set(context.Background(), "one", []byte("x"), Forever)
 	var ambiguous *AmbiguousWriteError
 	var protocol *ProtocolError
 	if errors.As(err, &ambiguous) || !errors.As(err, &protocol) {

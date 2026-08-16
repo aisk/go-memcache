@@ -23,9 +23,7 @@ type config struct {
 	router               Router
 	copyServersForRouter bool
 
-	defaultTTL          *time.Duration
 	defaultRefreshAhead *time.Duration
-	defaultWindow       *time.Duration
 	degrade             bool
 	onError             func(error)
 }
@@ -51,8 +49,7 @@ func defaultConfig(server string) config {
 type Option interface{ applyOption(*config) error }
 
 // PolicyOption is an Option that declares a client-wide policy default, such
-// as TTL, RefreshAhead, Window, Degrade, or OnError. Engine options are not
-// PolicyOptions.
+// as RefreshAhead, Degrade, or OnError. Engine options are not PolicyOptions.
 type PolicyOption interface {
 	Option
 	policyOption()
@@ -68,16 +65,20 @@ type PolicyOption interface {
 // change.
 type GetOption interface{ applyGet(*callPolicy) }
 
-// GetTouchOption modifies a GetTouch call.
+// GetTouchOption modifies a GetTouch call. No shipped option currently
+// applies; the parameter exists so future options need no signature change.
 type GetTouchOption interface{ applyGetTouch(*callPolicy) }
 
-// SetOption modifies a Set, SetMany, Add, or Replace call.
+// SetOption modifies a Set, SetMany, Add, or Replace call. No shipped option
+// currently applies; the parameter exists so future options need no signature
+// change.
 type SetOption interface{ applySet(*callPolicy) }
 
 // FetchOption modifies a Fetch call.
 type FetchOption interface{ applyFetch(*callPolicy) }
 
-// UpdateOption modifies an Update call.
+// UpdateOption modifies an Update call. No shipped option currently applies;
+// the parameter exists so future options need no signature change.
 type UpdateOption interface{ applyUpdate(*callPolicy) }
 
 // CounterOption modifies an Incr or Decr call.
@@ -86,70 +87,41 @@ type CounterOption interface{ applyCounter(*callPolicy) }
 // StreamOption modifies an Append or Prepend call.
 type StreamOption interface{ applyStream(*callPolicy) }
 
-// callPolicy resolves the two policy mount points: call-site options override
-// New-level defaults.
+// callPolicy resolves per-call options against New-level policy defaults.
 type callPolicy struct {
-	ttl          *time.Duration
 	refreshAhead *time.Duration
 	window       *time.Duration
 }
 
 func (c *config) callPolicy() callPolicy {
-	return callPolicy{ttl: c.defaultTTL, refreshAhead: c.defaultRefreshAhead, window: c.defaultWindow}
+	return callPolicy{refreshAhead: c.defaultRefreshAhead}
 }
 
-// resolveTTL enforces the no-silent-default rule: an operation that needs a
-// TTL fails when neither the call site nor New provides one. Storing without
-// expiration requires an explicit TTL(0).
-func (p *callPolicy) resolveTTL() (Expiration, error) {
-	if p.ttl == nil {
-		return 0, fmt.Errorf("memcache: no TTL configured: pass memcache.TTL at the call site or set a client-wide default; storing without expiration requires an explicit TTL(0)")
-	}
-	if *p.ttl < 0 {
+// Forever stores without expiration. TTL is a positional parameter on every
+// verb that needs one, so "never expire" is always a visible choice at the
+// call site, never a silent fallback.
+const Forever time.Duration = 0
+
+// resolveTTL validates a positional TTL. Zero (Forever) stores without
+// expiration; a negative duration is always a mistake.
+func resolveTTL(ttl time.Duration) (Expiration, error) {
+	if ttl < 0 {
 		return 0, fmt.Errorf("memcache: TTL must not be negative")
 	}
-	return ExpiresIn(*p.ttl), nil
+	return ExpiresIn(ttl), nil
 }
 
-// resolveWindow enforces the same rule for the counter and byte-stream
-// creation window. Auto-creation on miss needs the window's TTL on the wire,
-// so there is nothing sensible to fall back to.
+// resolveWindow enforces the no-silent-default rule for the counter and
+// byte-stream creation window. Auto-creation on miss needs the window's TTL on
+// the wire, so there is nothing sensible to fall back to.
 func (p *callPolicy) resolveWindow() (Expiration, error) {
 	if p.window == nil {
-		return 0, fmt.Errorf("memcache: no Window configured: pass memcache.Window at the call site or set a client-wide default")
+		return 0, fmt.Errorf("memcache: no Window configured: pass memcache.Window at the call site")
 	}
 	if *p.window <= 0 {
 		return 0, fmt.Errorf("memcache: Window must be positive")
 	}
 	return ExpiresIn(*p.window), nil
-}
-
-type ttlOption time.Duration
-
-func (o ttlOption) applyOption(c *config) error {
-	if o < 0 {
-		return fmt.Errorf("memcache: TTL must not be negative")
-	}
-	c.defaultTTL = ptr(time.Duration(o))
-	return nil
-}
-func (o ttlOption) policyOption()               {}
-func (o ttlOption) applySet(p *callPolicy)      { p.ttl = ptr(time.Duration(o)) }
-func (o ttlOption) applyFetch(p *callPolicy)    { p.ttl = ptr(time.Duration(o)) }
-func (o ttlOption) applyUpdate(p *callPolicy)   { p.ttl = ptr(time.Duration(o)) }
-func (o ttlOption) applyGetTouch(p *callPolicy) { p.ttl = ptr(time.Duration(o)) }
-
-// TTL sets the expiration for writes, Fetch, Update, and the duration a
-// GetTouch slides to, or a client-wide default when passed to New. TTL(0)
-// stores without expiration.
-func TTL(d time.Duration) interface {
-	PolicyOption
-	SetOption
-	FetchOption
-	UpdateOption
-	GetTouchOption
-} {
-	return ttlOption(d)
 }
 
 type refreshAheadOption time.Duration
@@ -176,23 +148,15 @@ func RefreshAhead(d time.Duration) interface {
 
 type windowOption time.Duration
 
-func (o windowOption) applyOption(c *config) error {
-	if o <= 0 {
-		return fmt.Errorf("memcache: Window must be positive")
-	}
-	c.defaultWindow = ptr(time.Duration(o))
-	return nil
-}
-func (o windowOption) policyOption()              {}
 func (o windowOption) applyCounter(p *callPolicy) { p.window = ptr(time.Duration(o)) }
 func (o windowOption) applyStream(p *callPolicy)  { p.window = ptr(time.Duration(o)) }
 
 // Window sets the TTL used when a counter or byte-stream key is auto-created
-// on miss. Unlike TTL it applies only at creation: later increments and
+// on miss. It stays a named option rather than a positional duration because
+// it is not a TTL: it applies only at creation, and later increments and
 // appends never extend it, which is exactly fixed-window rate limiting and
-// rolling event collection.
+// rolling event collection. Every counter and stream call must carry one.
 func Window(d time.Duration) interface {
-	PolicyOption
 	CounterOption
 	StreamOption
 } {

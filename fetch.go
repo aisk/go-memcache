@@ -32,11 +32,12 @@ type fetchFlight struct {
 	err   error
 }
 
-// Fetch returns the cached value or computes it exactly once. On a miss it
-// takes a server-side lease so that across processes and goroutines a single
-// loader runs while everyone else waits for its result; near expiry (inside
-// RefreshAhead) or during an Invalidate grace period it returns the current
-// value immediately and recomputes in the background. Fetch never fails
+// Fetch returns the cached value or computes it exactly once, storing the
+// computed value for ttl. On a miss it takes a server-side lease so that
+// across processes and goroutines a single loader runs while everyone else
+// waits for its result; near expiry (inside RefreshAhead) or during an
+// Invalidate grace period it returns the current value immediately and
+// recomputes in the background. Fetch never fails
 // because coordination failed: every path ends in a value, the loader's own
 // error, or the caller's context error, and write-back failures only reach
 // OnError. Paths that compute without a lease (Degrade, a lease held
@@ -49,7 +50,7 @@ type fetchFlight struct {
 // The loader receives a context owned by the client (carrying the winning
 // caller's deadline on the miss path) and must not rely on request-scoped
 // values.
-func (c *Client) Fetch(ctx context.Context, key string, loader func(context.Context) ([]byte, error), options ...FetchOption) ([]byte, error) {
+func (c *Client) Fetch(ctx context.Context, key string, ttl time.Duration, loader func(context.Context) ([]byte, error), options ...FetchOption) ([]byte, error) {
 	if loader == nil {
 		return nil, fmt.Errorf("memcache: Fetch requires a loader")
 	}
@@ -60,7 +61,7 @@ func (c *Client) Fetch(ctx context.Context, key string, loader func(context.Cont
 		}
 		option.applyFetch(&policy)
 	}
-	ttl, err := policy.resolveTTL()
+	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return nil, err
 	}
@@ -72,8 +73,8 @@ func (c *Client) Fetch(ctx context.Context, key string, loader func(context.Cont
 		}
 		// A window at or beyond the TTL would put every write-back already
 		// inside it, turning steady reads into a perpetual recompute loop.
-		if policy.ttl != nil && *policy.ttl > 0 && *policy.refreshAhead >= *policy.ttl {
-			return nil, fmt.Errorf("memcache: RefreshAhead (%v) must be shorter than the TTL (%v)", *policy.refreshAhead, *policy.ttl)
+		if ttl > 0 && *policy.refreshAhead >= ttl {
+			return nil, fmt.Errorf("memcache: RefreshAhead (%v) must be shorter than the TTL (%v)", *policy.refreshAhead, ttl)
 		}
 		refreshWindow = *policy.refreshAhead
 		refreshBefore = ptr(ExpiresIn(refreshWindow))
@@ -113,7 +114,7 @@ func (c *Client) Fetch(ctx context.Context, key string, loader func(context.Cont
 			// background; blocking it would recreate the latency spike this
 			// path exists to remove.
 			if result.Lease == LeaseGranted && result.Metadata.CAS != nil {
-				c.spawnRefresh(key, *result.Metadata.CAS, ttl, refreshWindow, loader)
+				c.spawnRefresh(key, *result.Metadata.CAS, expiration, refreshWindow, loader)
 			}
 			return result.Value, nil
 
@@ -121,7 +122,7 @@ func (c *Client) Fetch(ctx context.Context, key string, loader func(context.Cont
 			// This caller won the vivify lease: it recomputes synchronously
 			// (there is nothing to return otherwise) and same-process
 			// callers wait on its result.
-			return c.leadLoad(ctx, key, *result.Metadata.CAS, ttl, loader)
+			return c.leadLoad(ctx, key, *result.Metadata.CAS, expiration, loader)
 
 		case result.Status == GetHit && result.Lease != LeaseBusy:
 			// A genuinely stored zero-byte item, or an empty entry whose
@@ -129,7 +130,7 @@ func (c *Client) Fetch(ctx context.Context, key string, loader func(context.Cont
 			// coming to rewrite it, so waiting would pay the full backoff on
 			// every Fetch forever; replace it through its CAS instead.
 			if result.Metadata.CAS != nil {
-				return c.leadLoad(ctx, key, *result.Metadata.CAS, ttl, loader)
+				return c.leadLoad(ctx, key, *result.Metadata.CAS, expiration, loader)
 			}
 			return c.localCompute(ctx, key, loader)
 

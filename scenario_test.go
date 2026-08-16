@@ -12,16 +12,9 @@ import (
 // Compile-time proof of the option placement matrix: each policy option
 // implements exactly the verb interfaces the design table grants it.
 var (
-	_ PolicyOption   = TTL(0)
-	_ SetOption      = TTL(0)
-	_ FetchOption    = TTL(0)
-	_ UpdateOption   = TTL(0)
-	_ GetTouchOption = TTL(0)
-
 	_ PolicyOption = RefreshAhead(time.Second)
 	_ FetchOption  = RefreshAhead(time.Second)
 
-	_ PolicyOption  = Window(time.Second)
 	_ CounterOption = Window(time.Second)
 	_ StreamOption  = Window(time.Second)
 
@@ -37,6 +30,14 @@ func TestEngineOptionsAreNotPolicyOptions(t *testing.T) {
 	}
 }
 
+// Window is deliberately not a client-wide default: auto-creation semantics
+// must be visible at every counter and stream call site.
+func TestWindowIsNotAPolicyOption(t *testing.T) {
+	if _, ok := any(Window(time.Second)).(PolicyOption); ok {
+		t.Fatal("Window must not double as a policy default")
+	}
+}
+
 func TestPolicyResolutionErrors(t *testing.T) {
 	client, err := New("unused")
 	if err != nil {
@@ -45,18 +46,19 @@ func TestPolicyResolutionErrors(t *testing.T) {
 	ctx := context.Background()
 	loader := func(context.Context) ([]byte, error) { return []byte("x"), nil }
 	transform := func([]byte, bool) ([]byte, error) { return []byte("x"), nil }
-	needTTL := map[string]func() error{
-		"Set":      func() error { return client.Set(ctx, "k", []byte("v")) },
-		"SetMany":  func() error { return client.SetMany(ctx, map[string][]byte{"k": []byte("v")}) },
-		"Add":      func() error { _, err := client.Add(ctx, "k", []byte("v")); return err },
-		"Replace":  func() error { _, err := client.Replace(ctx, "k", []byte("v")); return err },
-		"Fetch":    func() error { _, err := client.Fetch(ctx, "k", loader); return err },
-		"Update":   func() error { _, err := client.Update(ctx, "k", transform); return err },
-		"GetTouch": func() error { _, _, err := client.GetTouch(ctx, "k"); return err },
+	negativeTTL := map[string]func() error{
+		"Set":      func() error { return client.Set(ctx, "k", []byte("v"), -time.Second) },
+		"SetMany":  func() error { return client.SetMany(ctx, map[string][]byte{"k": []byte("v")}, -time.Second) },
+		"Add":      func() error { _, err := client.Add(ctx, "k", []byte("v"), -time.Second); return err },
+		"Replace":  func() error { _, err := client.Replace(ctx, "k", []byte("v"), -time.Second); return err },
+		"Fetch":    func() error { _, err := client.Fetch(ctx, "k", -time.Second, loader); return err },
+		"Update":   func() error { _, err := client.Update(ctx, "k", -time.Second, transform); return err },
+		"GetTouch": func() error { _, _, err := client.GetTouch(ctx, "k", -time.Second); return err },
+		"Touch":    func() error { return client.Touch(ctx, "k", -time.Second) },
 	}
-	for name, call := range needTTL {
-		if err := call(); err == nil || !strings.Contains(err.Error(), "no TTL") {
-			t.Errorf("%s without TTL: %v", name, err)
+	for name, call := range negativeTTL {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "negative") {
+			t.Errorf("%s with a negative TTL: %v", name, err)
 		}
 	}
 	needWindow := map[string]func() error{
@@ -74,9 +76,7 @@ func TestPolicyResolutionErrors(t *testing.T) {
 
 func TestConstructorRejectsInvalidPolicyDefaults(t *testing.T) {
 	for name, option := range map[string]Option{
-		"negative TTL":      TTL(-time.Second),
 		"zero RefreshAhead": RefreshAhead(0),
-		"zero Window":       Window(0),
 		"nil OnError":       OnError(nil),
 	} {
 		if _, err := New("unused", option); err == nil {
@@ -86,18 +86,18 @@ func TestConstructorRejectsInvalidPolicyDefaults(t *testing.T) {
 }
 
 func TestEmptyValuesAreRejectedByWrites(t *testing.T) {
-	client, err := New("unused", TTL(time.Minute), Window(time.Minute))
+	client, err := New("unused")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
 	writes := map[string]func() error{
-		"Set":     func() error { return client.Set(ctx, "k", nil) },
-		"SetMany": func() error { return client.SetMany(ctx, map[string][]byte{"k": {}}) },
-		"Add":     func() error { _, err := client.Add(ctx, "k", nil); return err },
-		"Replace": func() error { _, err := client.Replace(ctx, "k", nil); return err },
-		"Append":  func() error { return client.Append(ctx, "k", nil) },
-		"Prepend": func() error { return client.Prepend(ctx, "k", nil) },
+		"Set":     func() error { return client.Set(ctx, "k", nil, time.Minute) },
+		"SetMany": func() error { return client.SetMany(ctx, map[string][]byte{"k": {}}, time.Minute) },
+		"Add":     func() error { _, err := client.Add(ctx, "k", nil, time.Minute); return err },
+		"Replace": func() error { _, err := client.Replace(ctx, "k", nil, time.Minute); return err },
+		"Append":  func() error { return client.Append(ctx, "k", nil, Window(time.Minute)) },
+		"Prepend": func() error { return client.Prepend(ctx, "k", nil, Window(time.Minute)) },
 	}
 	for name, call := range writes {
 		if err := call(); err == nil || !strings.Contains(err.Error(), "empty") {
@@ -130,7 +130,6 @@ func TestDegradeSurfacesUsageErrorsAndCancellation(t *testing.T) {
 	client, err := New("127.0.0.1:1",
 		WithDialTimeout(100*time.Millisecond),
 		Degrade(true),
-		TTL(time.Minute),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +138,7 @@ func TestDegradeSurfacesUsageErrorsAndCancellation(t *testing.T) {
 	ctx := context.Background()
 
 	oversized := make([]byte, 2<<20)
-	if err := client.Set(ctx, "k", oversized); err == nil || !strings.Contains(err.Error(), "maximum") {
+	if err := client.Set(ctx, "k", oversized, time.Minute); err == nil || !strings.Contains(err.Error(), "maximum") {
 		t.Fatalf("oversized set was absorbed: %v", err)
 	}
 	longKey := strings.Repeat("k", 300)
@@ -152,7 +151,7 @@ func TestDegradeSurfacesUsageErrorsAndCancellation(t *testing.T) {
 	if _, _, err := client.Get(canceled, "k"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled read was absorbed: %v", err)
 	}
-	if err := client.Set(canceled, "k", []byte("v")); !errors.Is(err, context.Canceled) {
+	if err := client.Set(canceled, "k", []byte("v"), time.Minute); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled write was absorbed: %v", err)
 	}
 }
@@ -165,7 +164,7 @@ func TestFetchRejectsRefreshAheadBeyondTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 	loader := func(context.Context) ([]byte, error) { return []byte("x"), nil }
-	_, err = client.Fetch(context.Background(), "k", loader, TTL(10*time.Second), RefreshAhead(30*time.Second))
+	_, err = client.Fetch(context.Background(), "k", 10*time.Second, loader, RefreshAhead(30*time.Second))
 	if err == nil || !strings.Contains(err.Error(), "RefreshAhead") {
 		t.Fatalf("oversized refresh window was accepted: %v", err)
 	}
@@ -178,8 +177,6 @@ func TestDegradePolicyAgainstDeadBackend(t *testing.T) {
 		WithDialTimeout(100*time.Millisecond),
 		Degrade(true),
 		OnError(func(error) { hooks.Add(1) }),
-		TTL(time.Minute),
-		Window(time.Minute),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -194,7 +191,7 @@ func TestDegradePolicyAgainstDeadBackend(t *testing.T) {
 	if found, err := client.GetMany(ctx, []string{"a", "b"}); err != nil || len(found) != 0 {
 		t.Fatalf("degraded get many: %#v, %v", found, err)
 	}
-	if _, ok, err := client.GetTouch(ctx, "k"); err != nil || ok {
+	if _, ok, err := client.GetTouch(ctx, "k", time.Minute); err != nil || ok {
 		t.Fatalf("degraded get touch: ok=%v err=%v", ok, err)
 	}
 	if _, ok, err := client.Inspect(ctx, "k"); err != nil || ok {
@@ -206,14 +203,14 @@ func TestDegradePolicyAgainstDeadBackend(t *testing.T) {
 
 	// Unconditional writes give up silently.
 	silent := map[string]func() error{
-		"Set":        func() error { return client.Set(ctx, "k", []byte("v")) },
-		"SetMany":    func() error { return client.SetMany(ctx, map[string][]byte{"k": []byte("v")}) },
+		"Set":        func() error { return client.Set(ctx, "k", []byte("v"), time.Minute) },
+		"SetMany":    func() error { return client.SetMany(ctx, map[string][]byte{"k": []byte("v")}, time.Minute) },
 		"Delete":     func() error { return client.Delete(ctx, "k") },
 		"DeleteMany": func() error { return client.DeleteMany(ctx, []string{"k"}) },
 		"Invalidate": func() error { return client.Invalidate(ctx, "k", time.Minute) },
 		"Touch":      func() error { return client.Touch(ctx, "k", time.Minute) },
-		"Append":     func() error { return client.Append(ctx, "k", []byte("v")) },
-		"Prepend":    func() error { return client.Prepend(ctx, "k", []byte("v")) },
+		"Append":     func() error { return client.Append(ctx, "k", []byte("v"), Window(time.Minute)) },
+		"Prepend":    func() error { return client.Prepend(ctx, "k", []byte("v"), Window(time.Minute)) },
 	}
 	for name, call := range silent {
 		if err := call(); err != nil {
@@ -223,13 +220,13 @@ func TestDegradePolicyAgainstDeadBackend(t *testing.T) {
 
 	// Verbs whose answer feeds a business decision keep failing loudly.
 	loud := map[string]func() error{
-		"Add":     func() error { _, err := client.Add(ctx, "k", []byte("v")); return err },
-		"Replace": func() error { _, err := client.Replace(ctx, "k", []byte("v")); return err },
-		"Incr":    func() error { _, err := client.Incr(ctx, "k", 1); return err },
-		"Decr":    func() error { _, err := client.Decr(ctx, "k", 1); return err },
+		"Add":     func() error { _, err := client.Add(ctx, "k", []byte("v"), time.Minute); return err },
+		"Replace": func() error { _, err := client.Replace(ctx, "k", []byte("v"), time.Minute); return err },
+		"Incr":    func() error { _, err := client.Incr(ctx, "k", 1, Window(time.Minute)); return err },
+		"Decr":    func() error { _, err := client.Decr(ctx, "k", 1, Window(time.Minute)); return err },
 		"Drain":   func() error { _, err := client.Drain(ctx, "k"); return err },
 		"Update": func() error {
-			_, err := client.Update(ctx, "k", func([]byte, bool) ([]byte, error) { return []byte("v"), nil })
+			_, err := client.Update(ctx, "k", time.Minute, func([]byte, bool) ([]byte, error) { return []byte("v"), nil })
 			return err
 		},
 	}
@@ -240,7 +237,7 @@ func TestDegradePolicyAgainstDeadBackend(t *testing.T) {
 	}
 
 	// Fetch degrades into a local computation.
-	value, err := client.Fetch(ctx, "k", func(context.Context) ([]byte, error) { return []byte("local"), nil })
+	value, err := client.Fetch(ctx, "k", time.Minute, func(context.Context) ([]byte, error) { return []byte("local"), nil })
 	if err != nil || string(value) != "local" {
 		t.Fatalf("degraded fetch: %q, %v", value, err)
 	}

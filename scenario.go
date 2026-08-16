@@ -151,13 +151,13 @@ func (c *Client) GetMany(ctx context.Context, keys []string, options ...GetOptio
 	return found, firstErr
 }
 
-// GetTouch reads a value and slides its expiration to the resolved TTL. It is
-// the read half of session renewal. The slide is a CAS-gated rewrite of the
-// value just read rather than a blind server-side touch: a blind touch would
-// also extend an entry marked stale by Invalidate, keeping revoked data alive
-// past its grace period. An entry that is missing, stale, or invalidated
-// mid-renewal reads as a miss and keeps decaying.
-func (c *Client) GetTouch(ctx context.Context, key string, options ...GetTouchOption) ([]byte, bool, error) {
+// GetTouch reads a value and slides its expiration to ttl. It is the read
+// half of session renewal. The slide is a CAS-gated rewrite of the value just
+// read rather than a blind server-side touch: a blind touch would also extend
+// an entry marked stale by Invalidate, keeping revoked data alive past its
+// grace period. An entry that is missing, stale, or invalidated mid-renewal
+// reads as a miss and keeps decaying.
+func (c *Client) GetTouch(ctx context.Context, key string, ttl time.Duration, options ...GetTouchOption) ([]byte, bool, error) {
 	policy := c.config.callPolicy()
 	for _, option := range options {
 		if option == nil {
@@ -165,7 +165,7 @@ func (c *Client) GetTouch(ctx context.Context, key string, options ...GetTouchOp
 		}
 		option.applyGetTouch(&policy)
 	}
-	ttl, err := policy.resolveTTL()
+	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return nil, false, err
 	}
@@ -182,7 +182,7 @@ func (c *Client) GetTouch(ctx context.Context, key string, options ...GetTouchOp
 		if result.Metadata.CAS == nil {
 			return nil, false, &ProtocolError{Message: "value read omitted requested CAS"}
 		}
-		write := SetOptions{TTL: ttl, Mode: ModeReplace, CompareCAS: result.Metadata.CAS}
+		write := SetOptions{TTL: expiration, Mode: ModeReplace, CompareCAS: result.Metadata.CAS}
 		if result.Metadata.ClientFlags != nil {
 			write.ClientFlags = *result.Metadata.ClientFlags
 		}
@@ -202,8 +202,9 @@ func (c *Client) GetTouch(ctx context.Context, key string, options ...GetTouchOp
 	return nil, false, ErrConflict
 }
 
-// Set unconditionally stores a value with the resolved TTL.
-func (c *Client) Set(ctx context.Context, key string, value []byte, options ...SetOption) error {
+// Set unconditionally stores a value for ttl. Storing without expiration is
+// the explicit choice Forever.
+func (c *Client) Set(ctx context.Context, key string, value []byte, ttl time.Duration, options ...SetOption) error {
 	policy := c.config.callPolicy()
 	for _, option := range options {
 		if option == nil {
@@ -211,14 +212,14 @@ func (c *Client) Set(ctx context.Context, key string, value []byte, options ...S
 		}
 		option.applySet(&policy)
 	}
-	ttl, err := policy.resolveTTL()
+	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return err
 	}
 	if len(value) == 0 {
 		return errEmptyValue
 	}
-	status, err := c.sceneStore(ctx, key, value, SetOptions{TTL: ttl})
+	status, err := c.sceneStore(ctx, key, value, SetOptions{TTL: expiration})
 	if err != nil {
 		if c.absorb(ctx, err) {
 			return nil
@@ -231,8 +232,9 @@ func (c *Client) Set(ctx context.Context, key string, value []byte, options ...S
 	return nil
 }
 
-// SetMany stores a set of values in one round trip per backend.
-func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, options ...SetOption) error {
+// SetMany stores a set of values in one round trip per backend, all sharing
+// the same ttl.
+func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, ttl time.Duration, options ...SetOption) error {
 	policy := c.config.callPolicy()
 	for _, option := range options {
 		if option == nil {
@@ -240,7 +242,7 @@ func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, options
 		}
 		option.applySet(&policy)
 	}
-	ttl, err := policy.resolveTTL()
+	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return err
 	}
@@ -249,7 +251,7 @@ func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, options
 		if len(value) == 0 {
 			return fmt.Errorf("memcache: value for %q: %w", key, errEmptyValue)
 		}
-		operations = append(operations, SetOperation{Key: key, Value: value, Options: SetOptions{TTL: ttl}})
+		operations = append(operations, SetOperation{Key: key, Value: value, Options: SetOptions{TTL: expiration}})
 	}
 	results, err := c.batch(ctx, operations)
 	if err != nil {
@@ -267,7 +269,7 @@ func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, options
 // Add stores only when the key is absent and reports whether this caller won.
 // The bool is the scenario's whole answer, so Add keeps it; it is also why
 // Degrade never fakes a result here.
-func (c *Client) Add(ctx context.Context, key string, value []byte, options ...SetOption) (bool, error) {
+func (c *Client) Add(ctx context.Context, key string, value []byte, ttl time.Duration, options ...SetOption) (bool, error) {
 	policy := c.config.callPolicy()
 	for _, option := range options {
 		if option == nil {
@@ -275,14 +277,14 @@ func (c *Client) Add(ctx context.Context, key string, value []byte, options ...S
 		}
 		option.applySet(&policy)
 	}
-	ttl, err := policy.resolveTTL()
+	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return false, err
 	}
 	if len(value) == 0 {
 		return false, errEmptyValue
 	}
-	status, err := c.sceneStore(ctx, key, value, SetOptions{TTL: ttl, Mode: ModeAdd})
+	status, err := c.sceneStore(ctx, key, value, SetOptions{TTL: expiration, Mode: ModeAdd})
 	if err != nil {
 		return false, err
 	}
@@ -292,7 +294,7 @@ func (c *Client) Add(ctx context.Context, key string, value []byte, options ...S
 // Replace stores only when the key still exists and reports whether it did.
 // It is the write half of session renewal: false means the session ended
 // mid-request and there is nothing to write back to.
-func (c *Client) Replace(ctx context.Context, key string, value []byte, options ...SetOption) (bool, error) {
+func (c *Client) Replace(ctx context.Context, key string, value []byte, ttl time.Duration, options ...SetOption) (bool, error) {
 	policy := c.config.callPolicy()
 	for _, option := range options {
 		if option == nil {
@@ -300,14 +302,14 @@ func (c *Client) Replace(ctx context.Context, key string, value []byte, options 
 		}
 		option.applySet(&policy)
 	}
-	ttl, err := policy.resolveTTL()
+	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return false, err
 	}
 	if len(value) == 0 {
 		return false, errEmptyValue
 	}
-	status, err := c.sceneStore(ctx, key, value, SetOptions{TTL: ttl, Mode: ModeReplace})
+	status, err := c.sceneStore(ctx, key, value, SetOptions{TTL: expiration, Mode: ModeReplace})
 	if err != nil {
 		return false, err
 	}
@@ -317,14 +319,14 @@ func (c *Client) Replace(ctx context.Context, key string, value []byte, options 
 // updateAttempts bounds the optimistic concurrency loops in Update and Drain.
 const updateAttempts = 8
 
-// Update atomically transforms a value: read with version, apply fn, write
-// back only if unchanged, retry on conflict. Version tokens never appear in
-// user code. On a miss fn receives (nil, false); returning an error from fn
-// aborts the whole operation without writing. fn may run multiple times and
-// must be pure. A value kept stale by Invalidate is treated as a miss: fn
-// transforms rather than recomputes, and transforming invalidated data would
-// silently launder it back to fresh.
-func (c *Client) Update(ctx context.Context, key string, fn func(current []byte, found bool) ([]byte, error), options ...UpdateOption) ([]byte, error) {
+// Update atomically transforms a value and stores the result for ttl: read
+// with version, apply fn, write back only if unchanged, retry on conflict.
+// Version tokens never appear in user code. On a miss fn receives (nil,
+// false); returning an error from fn aborts the whole operation without
+// writing. fn may run multiple times and must be pure. A value kept stale by
+// Invalidate is treated as a miss: fn transforms rather than recomputes, and
+// transforming invalidated data would silently launder it back to fresh.
+func (c *Client) Update(ctx context.Context, key string, ttl time.Duration, fn func(current []byte, found bool) ([]byte, error), options ...UpdateOption) ([]byte, error) {
 	if fn == nil {
 		return nil, fmt.Errorf("memcache: Update requires a transform function")
 	}
@@ -335,7 +337,7 @@ func (c *Client) Update(ctx context.Context, key string, fn func(current []byte,
 		}
 		option.applyUpdate(&policy)
 	}
-	ttl, err := policy.resolveTTL()
+	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return nil, err
 	}
@@ -380,7 +382,7 @@ func (c *Client) Update(ctx context.Context, key string, fn func(current []byte,
 			}
 			return nil, errEmptyValue
 		}
-		writeOptions := SetOptions{TTL: ttl}
+		writeOptions := SetOptions{TTL: expiration}
 		if compareCAS != nil {
 			writeOptions.CompareCAS = compareCAS
 		} else {
@@ -465,15 +467,13 @@ func (c *Client) Invalidate(ctx context.Context, key string, grace time.Duration
 	return err
 }
 
-// Touch extends a key's TTL without transferring its value. The TTL is a
-// positional parameter: it is the whole operation, and a silently resolved
-// "never expire" would be the most dangerous possible fallback. A missing key
-// is not an error; there is simply nothing left to extend. An entry marked
-// stale by Invalidate is left alone: extending it would keep revoked data
-// alive, so it keeps decaying toward its miss.
+// Touch extends a key's TTL without transferring its value. A missing key is
+// not an error; there is simply nothing left to extend. An entry marked stale
+// by Invalidate is left alone: extending it would keep revoked data alive, so
+// it keeps decaying toward its miss.
 func (c *Client) Touch(ctx context.Context, key string, ttl time.Duration) error {
-	if ttl < 0 {
-		return fmt.Errorf("memcache: TTL must not be negative")
+	if _, err := resolveTTL(ttl); err != nil {
+		return err
 	}
 	probe := sceneReadOptions()
 	probe.MetadataOnly = true

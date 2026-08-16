@@ -20,33 +20,29 @@ raw, ok, err := mc.Get(ctx, "user:42")   // value, presence, failure: three axes
 if err != nil { /* infrastructure failure */ }
 if !ok { /* miss: recompute and store */ }
 
-err = mc.Set(ctx, "user:42", buf, memcache.TTL(10*time.Minute))
+err = mc.Set(ctx, "user:42", buf, 10*time.Minute)
 ```
 
-需要 TTL 的操作会先从调用点解析，然后回退到 `New` 时声明的客户端级默认值，两者都没有则失败。存储永不过期的值必须显式写 `TTL(0)`。
+每个存值的操作都把 TTL 作为位置参数，与 go-redis 的惯例一致。没有客户端级的默认 TTL：每个调用点都能直接看到数据的生存期，存储永不过期的值是一个显式选择 `memcache.Forever`。
 
 ```go
-mc, err := memcache.New("127.0.0.1:11211",
-    memcache.WithTimeout(time.Second),  // engine option
-    memcache.TTL(5*time.Minute),        // policy options double as client-wide defaults
-)
+err = mc.Set(ctx, "config:site", buf, memcache.Forever)
 ```
 
-选项按动词做了类型约束：`TTL` 被写操作、`Fetch`、`Update` 和 `GetTouch` 接受，`RefreshAhead` 只被 `Fetch` 接受，`Window` 只被计数器和流接受。把选项用在没有意义的动词上是编译错误，而不是运行时意外。
+可选修饰按动词做了类型约束：`RefreshAhead` 只被 `Fetch` 接受，`Window` 只被计数器和流接受。把选项用在没有意义的动词上是编译错误，而不是运行时意外。
 
 ## 获取或计算：Fetch
 
 `Fetch` 把最高频的缓存场景浓缩成一个动词：返回缓存值，或者恰好计算一次。
 
 ```go
-report, err := mc.Fetch(ctx, "report:q3", buildReport, memcache.TTL(time.Hour))
+report, err := mc.Fetch(ctx, "report:q3", time.Hour, buildReport)
 ```
 
 未命中时，所有进程中只有一个调用者赢得服务端租约（meta vivify）并运行加载函数。同进程内的其他 goroutine 等待这个结果，其他进程短暂等待后本地计算且不写回。启用 `RefreshAhead` 后，临近过期的值会被立即返回，同时选出一个调用者在后台 goroutine 中重算，因此没有任何请求需要承担重算延迟：
 
 ```go
-feed, err := mc.Fetch(ctx, "home:"+uid, buildFeed,
-    memcache.TTL(5*time.Minute),
+feed, err := mc.Fetch(ctx, "home:"+uid, 5*time.Minute, buildFeed,
     memcache.RefreshAhead(30*time.Second),
 )
 ```
@@ -58,7 +54,7 @@ feed, err := mc.Fetch(ctx, "home:"+uid, buildFeed,
 `Update` 在内部执行「读、变换、条件写、重试」循环，版本令牌永远不会出现在用户代码中：
 
 ```go
-cart, err := mc.Update(ctx, "cart:"+uid,
+cart, err := mc.Update(ctx, "cart:"+uid, 30*time.Minute,
     func(current []byte, found bool) ([]byte, error) {
         var items []Item
         if found {
@@ -68,7 +64,6 @@ cart, err := mc.Update(ctx, "cart:"+uid,
         }
         return json.Marshal(append(items, item))
     },
-    memcache.TTL(30*time.Minute),
 )
 ```
 
