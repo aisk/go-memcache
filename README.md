@@ -1,5 +1,7 @@
 # memcache
 
+English | [简体中文](README.zh-CN.md)
+
 `memcache` is a concurrent Go client for memcached's modern meta text protocol. It implements `mg`, `ms`, `md`, `ma`, `me`, and `mn`; it does not carry a legacy get/set protocol implementation.
 
 The client is scenario oriented: one verb per user scenario, built on four axioms. A miss is a normal answer, not an error. Every cached value has a source of truth and a recompute path, so "get or compute" is a first-class verb. Concurrency coordination (leases, compare-and-swap loops, request merging) is the library's job and never appears in caller code. The cache is an availability optimization, so failure behavior is an explicit policy.
