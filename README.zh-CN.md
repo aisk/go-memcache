@@ -125,7 +125,7 @@ loader 运行在客户端持有的 context 上而不是调用请求的 context �
 
 ```go
 func (c *Client) Update(ctx context.Context, key string, ttl time.Duration,
-    fn func(current []byte, found bool) ([]byte, error), options ...UpdateOption) ([]byte, error)
+    fn func(current []byte, found bool) ([]byte, error)) ([]byte, error)
 ```
 
 `Update` 原子地变换一个值。它带版本读出当前值，应用 `fn`，只在中间没有别人改动时写回，冲突则重试。未命中时 `fn` 收到 `(nil, false)`。`fn` 返回错误会中止整个操作且不写入。`fn` 可能运行多次，因此必须是纯函数。如果重试循环一直输给并发写入者，`Update` 返回 `ErrConflict`。

@@ -63,26 +63,8 @@ type PolicyOption interface {
 // GetOption modifies a single Get or GetMany call.
 type GetOption interface{ applyGet(*callPolicy) }
 
-// SetOption modifies a Set, SetMany, Add, or Replace call. No shipped option
-// currently applies; the parameter exists so future options need no signature
-// change.
-type SetOption interface{ applySet(*callPolicy) }
-
 // FetchOption modifies a Fetch call.
 type FetchOption interface{ applyFetch(*callPolicy) }
-
-// UpdateOption modifies an Update call. No shipped option currently applies;
-// the parameter exists so future options need no signature change.
-type UpdateOption interface{ applyUpdate(*callPolicy) }
-
-// CounterOption modifies an Incr or Decr call. No shipped option currently
-// applies; the parameter exists so future options need no signature change.
-type CounterOption interface{ applyCounter(*callPolicy) }
-
-// AppendOption modifies an Append or Prepend call. No shipped option
-// currently applies; the parameter exists so future options need no
-// signature change.
-type AppendOption interface{ applyAppend(*callPolicy) }
 
 // callPolicy resolves per-call options against New-level policy defaults.
 type callPolicy struct {

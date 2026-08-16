@@ -125,7 +125,7 @@ The loader runs on a context owned by the client, not the calling request's cont
 
 ```go
 func (c *Client) Update(ctx context.Context, key string, ttl time.Duration,
-    fn func(current []byte, found bool) ([]byte, error), options ...UpdateOption) ([]byte, error)
+    fn func(current []byte, found bool) ([]byte, error)) ([]byte, error)
 ```
 
 `Update` atomically transforms a value. It reads the current value with its version, applies `fn`, writes back only if nothing changed in between, and retries on conflict. On a miss `fn` receives `(nil, false)`. Returning an error from `fn` aborts without writing. `fn` may run multiple times, so it must be pure. If the retry loop keeps losing to concurrent writers, `Update` returns `ErrConflict`.

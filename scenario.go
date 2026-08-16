@@ -175,14 +175,7 @@ func (c *Client) GetMany(ctx context.Context, keys []string, options ...GetOptio
 
 // Set unconditionally stores a value for ttl. Storing without expiration is
 // the explicit choice Forever.
-func (c *Client) Set(ctx context.Context, key string, value []byte, ttl time.Duration, options ...SetOption) error {
-	policy := c.config.callPolicy()
-	for _, option := range options {
-		if option == nil {
-			return errNilOption
-		}
-		option.applySet(&policy)
-	}
+func (c *Client) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return err
@@ -205,14 +198,7 @@ func (c *Client) Set(ctx context.Context, key string, value []byte, ttl time.Dur
 
 // SetMany stores a set of values in one round trip per backend, all sharing
 // the same ttl.
-func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, ttl time.Duration, options ...SetOption) error {
-	policy := c.config.callPolicy()
-	for _, option := range options {
-		if option == nil {
-			return errNilOption
-		}
-		option.applySet(&policy)
-	}
+func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, ttl time.Duration) error {
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return err
@@ -240,14 +226,7 @@ func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, ttl tim
 // Add stores only when the key is absent and reports whether this caller won.
 // The bool is the scenario's whole answer, so Add keeps it; it is also why
 // Degrade never fakes a result here.
-func (c *Client) Add(ctx context.Context, key string, value []byte, ttl time.Duration, options ...SetOption) (bool, error) {
-	policy := c.config.callPolicy()
-	for _, option := range options {
-		if option == nil {
-			return false, errNilOption
-		}
-		option.applySet(&policy)
-	}
+func (c *Client) Add(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return false, err
@@ -265,14 +244,7 @@ func (c *Client) Add(ctx context.Context, key string, value []byte, ttl time.Dur
 // Replace stores only when the key still exists and reports whether it did.
 // It is the write half of session renewal: false means the session ended
 // mid-request and there is nothing to write back to.
-func (c *Client) Replace(ctx context.Context, key string, value []byte, ttl time.Duration, options ...SetOption) (bool, error) {
-	policy := c.config.callPolicy()
-	for _, option := range options {
-		if option == nil {
-			return false, errNilOption
-		}
-		option.applySet(&policy)
-	}
+func (c *Client) Replace(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return false, err
@@ -297,16 +269,9 @@ const updateAttempts = 8
 // writing. fn may run multiple times and must be pure. A value kept stale by
 // Invalidate is treated as a miss: fn transforms rather than recomputes, and
 // transforming invalidated data would silently launder it back to fresh.
-func (c *Client) Update(ctx context.Context, key string, ttl time.Duration, fn func(current []byte, found bool) ([]byte, error), options ...UpdateOption) ([]byte, error) {
+func (c *Client) Update(ctx context.Context, key string, ttl time.Duration, fn func(current []byte, found bool) ([]byte, error)) ([]byte, error) {
 	if fn == nil {
 		return nil, fmt.Errorf("memcache: Update requires a transform function")
-	}
-	policy := c.config.callPolicy()
-	for _, option := range options {
-		if option == nil {
-			return nil, errNilOption
-		}
-		option.applyUpdate(&policy)
 	}
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
@@ -508,14 +473,7 @@ func (c *Client) Inspect(ctx context.Context, key string) (ItemInfo, bool, error
 }
 
 // counter is the shared implementation of Incr and Decr.
-func (c *Client) counter(ctx context.Context, key string, delta uint64, decrement bool, ttl time.Duration, options []CounterOption) (uint64, error) {
-	policy := c.config.callPolicy()
-	for _, option := range options {
-		if option == nil {
-			return 0, errNilOption
-		}
-		option.applyCounter(&policy)
-	}
+func (c *Client) counter(ctx context.Context, key string, delta uint64, decrement bool, ttl time.Duration) (uint64, error) {
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return 0, err
@@ -551,26 +509,19 @@ func (c *Client) counter(ctx context.Context, key string, delta uint64, decremen
 // increments never extend an existing counter's lifetime, which is exactly
 // what fixed-window counting needs. The result feeds business decisions, so
 // Degrade never fakes one: infrastructure failures surface.
-func (c *Client) Incr(ctx context.Context, key string, delta uint64, ttl time.Duration, options ...CounterOption) (uint64, error) {
-	return c.counter(ctx, key, delta, false, ttl, options)
+func (c *Client) Incr(ctx context.Context, key string, delta uint64, ttl time.Duration) (uint64, error) {
+	return c.counter(ctx, key, delta, false, ttl)
 }
 
 // Decr subtracts delta from a decimal counter, saturating at zero. A miss
 // creates the counter at zero with ttl; as with Incr, the ttl applies only
 // at creation.
-func (c *Client) Decr(ctx context.Context, key string, delta uint64, ttl time.Duration, options ...CounterOption) (uint64, error) {
-	return c.counter(ctx, key, delta, true, ttl, options)
+func (c *Client) Decr(ctx context.Context, key string, delta uint64, ttl time.Duration) (uint64, error) {
+	return c.counter(ctx, key, delta, true, ttl)
 }
 
 // concat is the shared implementation of Append and Prepend.
-func (c *Client) concat(ctx context.Context, key string, fragment []byte, mode StoreMode, ttl time.Duration, options []AppendOption) error {
-	policy := c.config.callPolicy()
-	for _, option := range options {
-		if option == nil {
-			return errNilOption
-		}
-		option.applyAppend(&policy)
-	}
+func (c *Client) concat(ctx context.Context, key string, fragment []byte, mode StoreMode, ttl time.Duration) error {
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return err
@@ -595,14 +546,14 @@ func (c *Client) concat(ctx context.Context, key string, fragment []byte, mode S
 // with ttl on a miss. The ttl applies only at creation; later appends never
 // extend an existing value's lifetime. Fragments bypass any value encoding;
 // how the accumulated bytes are structured is the caller's business.
-func (c *Client) Append(ctx context.Context, key string, fragment []byte, ttl time.Duration, options ...AppendOption) error {
-	return c.concat(ctx, key, fragment, ModeAppend, ttl, options)
+func (c *Client) Append(ctx context.Context, key string, fragment []byte, ttl time.Duration) error {
+	return c.concat(ctx, key, fragment, ModeAppend, ttl)
 }
 
 // Prepend adds a fragment to the front of a raw bytes value, creating the
 // value with ttl on a miss; as with Append, the ttl applies only at creation.
-func (c *Client) Prepend(ctx context.Context, key string, fragment []byte, ttl time.Duration, options ...AppendOption) error {
-	return c.concat(ctx, key, fragment, ModePrepend, ttl, options)
+func (c *Client) Prepend(ctx context.Context, key string, fragment []byte, ttl time.Duration) error {
+	return c.concat(ctx, key, fragment, ModePrepend, ttl)
 }
 
 // Take atomically reads a value and deletes it: read with version, delete
