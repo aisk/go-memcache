@@ -2,9 +2,9 @@
 
 English | [简体中文](README.zh-CN.md)
 
-`memcache` is a concurrent Go client for memcached's modern meta text protocol (`mg`, `ms`, `md`, `ma`, `me`, `mn`). It does not carry a legacy get/set protocol implementation.
+`memcache` is a concurrent Go client for memcached, speaking the modern meta text protocol. It does not carry a legacy get/set protocol implementation.
 
-The API is designed to hide the wire protocol behind verbs named after what you are doing. CAS tokens never appear in caller code. Instead of reading a version and writing it back yourself, you call `Update` with a transform function and the client runs the read, compare and swap, retry loop internally. Instead of building lease or dogpile protection yourself, you call `Fetch` with a loader and the client coordinates so the value is computed once. When you do need the raw protocol, every meta command is still reachable through `Meta()`.
+The API hides the wire protocol behind verbs named for what you are doing. The meta protocol's CAS tokens and leases never surface in caller code. Instead of reading a version and writing it back, call `Update` with a transform function and the client runs the read, compare and swap, retry loop internally. Instead of building dogpile protection, call `Fetch` with a loader and the client makes sure the value is computed once. When you do need the raw protocol, every meta command is still reachable through `Meta()`.
 
 ## Conventions
 
