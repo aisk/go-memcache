@@ -552,7 +552,7 @@ func TestIntegrationMultiServerPartialFailure(t *testing.T) {
 }
 
 // The zero-byte rule: memcached represents lease placeholders as zero-byte
-// items, so scenario reads fold an empty value into a miss instead of leaking
+// items, so Client reads fold an empty value into a miss instead of leaking
 // coordination internals as a normal hit.
 func TestIntegrationZeroByteValueReadsAsMiss(t *testing.T) {
 	c := integrationClient(t)

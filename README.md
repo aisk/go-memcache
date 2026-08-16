@@ -103,7 +103,7 @@ func (c *Client) Fetch(ctx context.Context, key string, ttl time.Duration,
     loader func(context.Context) ([]byte, error), options ...FetchOption) ([]byte, error)
 ```
 
-`Fetch` is the highest frequency cache scenario as one verb. It returns the cached value, or runs `loader` to compute it and stores the result for `ttl`.
+`Fetch` is the highest frequency cache pattern as one verb. It returns the cached value, or runs `loader` to compute it and stores the result for `ttl`.
 
 ```go
 report, err := mc.Fetch(ctx, "report:q3", time.Hour, buildReport)
@@ -178,7 +178,7 @@ Verbs whose answer feeds a business decision (`Add`, `Replace`, `Update`, `Incr`
 
 ## Protocol access
 
-Everything not covered by a scenario verb lives behind `Meta()`, a 1:1 mapping of the meta protocol that returns typed results instead of collapsing protocol states into errors.
+Everything the Client's verbs do not cover lives behind `Meta()`, a 1:1 mapping of the meta protocol that returns typed results instead of collapsing protocol states into errors.
 
 ```go
 func (m *MetaClient) Get(ctx context.Context, key string, options MetaGetOptions) (GetResult, error)

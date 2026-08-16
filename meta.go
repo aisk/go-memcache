@@ -5,7 +5,7 @@ import "context"
 // MetaClient is the 1:1 protocol layer behind Client.Meta. Its methods map
 // directly onto the meta commands (mg, ms, md, ma, me, mn) and return typed
 // results without collapsing protocol states into errors. Anything the
-// scenario verbs do not cover is expressible here.
+// Client's verbs do not cover is expressible here.
 type MetaClient struct{ client *Client }
 
 // Meta returns the protocol-layer escape hatch. The returned client shares

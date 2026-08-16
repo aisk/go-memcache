@@ -8,9 +8,9 @@ import (
 	"sync"
 )
 
-// Client is a concurrent meta-protocol memcached client. Its methods are the
-// scenario layer: one verb per user scenario, returning business values. The
-// 1:1 protocol layer stays available behind Meta.
+// Client is a concurrent meta-protocol memcached client. Its methods are
+// one verb per operation, returning business values. The 1:1 protocol layer
+// stays available behind Meta.
 type Client struct {
 	config        config
 	servers       []*serverPool

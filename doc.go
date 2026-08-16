@@ -1,8 +1,8 @@
 // Package memcache implements a modern memcached client using only the meta
 // text protocol (mg, ms, md, ma, me, and mn).
 //
-// The Client's methods are the scenario layer: one verb per user scenario
-// (Get, Fetch, Update, Incr, Take, ...), returning business values. A miss
+// The Client's methods are one verb per operation (Get, Fetch, Update,
+// Incr, Take, ...), each returning business values. A miss
 // is a normal answer, never an error; concurrency coordination (leases,
 // compare-and-swap loops, request merging) is the library's job and never
 // appears in caller code; failure behavior is an explicit policy (Degrade,

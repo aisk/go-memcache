@@ -7,7 +7,7 @@ import (
 
 var (
 	// ErrCacheMiss is a protocol-layer sentinel returned by MetaClient.Debug
-	// when the key is absent. Scenario verbs never return it: a miss is a
+	// when the key is absent. Client verbs never return it: a miss is a
 	// normal answer there, expressed by the ok result or key absence.
 	ErrCacheMiss = errors.New("memcache: cache miss")
 	// ErrClosed is returned after a client has been closed.
@@ -18,6 +18,13 @@ var (
 	// retry loop keeps losing to concurrent writers.
 	ErrConflict = errors.New("memcache: too many conflicting concurrent writes")
 )
+
+var errNilOption = errors.New("memcache: nil option")
+
+// errEmptyValue enforces the zero-byte rule: memcached represents lease
+// placeholders as zero-byte items, so the Client's writes reject empty
+// values and its reads fold them into a miss.
+var errEmptyValue = errors.New("memcache: empty values are reserved as lease placeholders; store a non-empty encoding")
 
 // usageError marks a client-side mistake (invalid key, oversized value,
 // malformed command) detected before any network exchange. It is permanent:

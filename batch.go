@@ -167,8 +167,9 @@ func successResponseRequired(item preparedOperation) bool {
 }
 
 // batch executes operations in pipelines grouped by backend and restores
-// input order. It backs MetaClient.Batch and the scenario-layer collection
-// verbs. All operations are validated before any network write.
+// input order. It backs MetaClient.Batch and the collection verbs GetMany,
+// SetMany, and DeleteMany. All operations are validated before any network
+// write.
 // Per-operation transport failures are returned in OperationResult.Err so a
 // failure on one backend does not erase successful results from another.
 func (c *Client) batch(ctx context.Context, operations []Operation) ([]OperationResult, error) {

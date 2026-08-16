@@ -36,12 +36,12 @@ func TestPolicyResolutionErrors(t *testing.T) {
 	loader := func(context.Context) ([]byte, error) { return []byte("x"), nil }
 	transform := func([]byte, bool) ([]byte, error) { return []byte("x"), nil }
 	negativeTTL := map[string]func() error{
-		"Set":      func() error { return client.Set(ctx, "k", []byte("v"), -time.Second) },
-		"SetMany":  func() error { return client.SetMany(ctx, map[string][]byte{"k": []byte("v")}, -time.Second) },
-		"Add":      func() error { _, err := client.Add(ctx, "k", []byte("v"), -time.Second); return err },
-		"Replace":  func() error { _, err := client.Replace(ctx, "k", []byte("v"), -time.Second); return err },
-		"Fetch":    func() error { _, err := client.Fetch(ctx, "k", -time.Second, loader); return err },
-		"Update":   func() error { _, err := client.Update(ctx, "k", -time.Second, transform); return err },
+		"Set":       func() error { return client.Set(ctx, "k", []byte("v"), -time.Second) },
+		"SetMany":   func() error { return client.SetMany(ctx, map[string][]byte{"k": []byte("v")}, -time.Second) },
+		"Add":       func() error { _, err := client.Add(ctx, "k", []byte("v"), -time.Second); return err },
+		"Replace":   func() error { _, err := client.Replace(ctx, "k", []byte("v"), -time.Second); return err },
+		"Fetch":     func() error { _, err := client.Fetch(ctx, "k", -time.Second, loader); return err },
+		"Update":    func() error { _, err := client.Update(ctx, "k", -time.Second, transform); return err },
 		"Get+Touch": func() error { _, _, err := client.Get(ctx, "k", Touch(-time.Second)); return err },
 		"GetMany+Touch": func() error {
 			_, err := client.GetMany(ctx, []string{"k"}, Touch(-time.Second))
