@@ -8,12 +8,24 @@ import (
 	"sync"
 )
 
-// Client is a concurrent meta-protocol memcached client.
+// Client is a concurrent meta-protocol memcached client. Its methods are the
+// scenario layer: one verb per user scenario, returning business values. The
+// 1:1 protocol layer stays available behind Meta.
 type Client struct {
 	config        config
 	servers       []*serverPool
 	serverIndexes map[string]int
 	close         sync.Once
+
+	// rootCtx owns every background goroutine the client spawns; Close
+	// cancels it.
+	rootCtx    context.Context
+	cancelRoot context.CancelFunc
+
+	// fetchMu guards the in-process Fetch coordination state.
+	fetchMu      sync.Mutex
+	fetchFlights map[string]*fetchFlight
+	refreshing   map[string]struct{}
 }
 
 // New creates a lazy client. No connection is opened until the first command.
@@ -23,7 +35,7 @@ func New(server string, options ...Option) (*Client, error) {
 		if option == nil {
 			return nil, fmt.Errorf("memcache: nil option")
 		}
-		if err := option(&cfg); err != nil {
+		if err := option.applyOption(&cfg); err != nil {
 			return nil, err
 		}
 	}
@@ -35,8 +47,10 @@ func New(server string, options ...Option) (*Client, error) {
 	}
 	seen := make(map[string]struct{}, len(cfg.servers))
 	client := &Client{
-		config:  cfg,
-		servers: make([]*serverPool, len(cfg.servers)),
+		config:       cfg,
+		servers:      make([]*serverPool, len(cfg.servers)),
+		fetchFlights: make(map[string]*fetchFlight),
+		refreshing:   make(map[string]struct{}),
 	}
 	if cfg.copyServersForRouter {
 		client.serverIndexes = make(map[string]int, len(cfg.servers))
@@ -54,6 +68,8 @@ func New(server string, options ...Option) (*Client, error) {
 			client.serverIndexes[address] = i
 		}
 	}
+	// Created after validation so no error path leaks the cancelable context.
+	client.rootCtx, client.cancelRoot = context.WithCancel(context.Background())
 	return client, nil
 }
 
@@ -93,10 +109,12 @@ func (c *Client) server(key string) (*serverPool, error) {
 	return c.servers[poolIndex], nil
 }
 
-// Close releases idle connections and prevents new work. In-flight requests
-// are allowed to finish. Close is idempotent.
+// Close cancels background refreshes and any in-flight Fetch loaders,
+// releases idle connections, and prevents new work. Requests already on the
+// wire finish their exchange. Close is idempotent.
 func (c *Client) Close() error {
 	c.close.Do(func() {
+		c.cancelRoot()
 		for _, server := range c.servers {
 			server.close()
 		}
@@ -104,23 +122,57 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// ExecuteMeta runs a raw command against the server selected by its key.
-func (c *Client) ExecuteMeta(ctx context.Context, command MetaCommand) (RawResponse, error) {
+// reportError delivers an error that never reaches a caller to the OnError
+// hook, when one is installed.
+func (c *Client) reportError(err error) {
+	if err != nil && c.config.onError != nil {
+		c.config.onError(err)
+	}
+}
+
+// absorb decides whether the Degrade policy swallows err. Only
+// infrastructure failures qualify. Ambiguous writes always surface: degrading
+// covers "the cache is down", never "the write may or may not have landed".
+// Usage errors are permanent client-side mistakes that would otherwise become
+// silent fake results on every call. The caller's own context cancellation is
+// the caller's answer, not the cache's, so it surfaces too. Absorbed errors
+// are reported to OnError.
+func (c *Client) absorb(ctx context.Context, err error) bool {
+	if err == nil || !c.config.degrade {
+		return false
+	}
+	var ambiguous *AmbiguousWriteError
+	if errors.As(err, &ambiguous) {
+		return false
+	}
+	var usage *usageError
+	if errors.As(err, &usage) {
+		return false
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+		return false
+	}
+	c.reportError(err)
+	return true
+}
+
+// executeMeta runs a raw command against the server selected by its key.
+func (c *Client) executeMeta(ctx context.Context, command MetaCommand) (RawResponse, error) {
 	for _, flag := range command.Flags {
 		if flag == "q" {
-			return RawResponse{}, fmt.Errorf("memcache: quiet commands require Batch or an explicit mn barrier")
+			return RawResponse{}, &usageError{fmt.Errorf("memcache: quiet commands require Batch or an explicit mn barrier")}
 		}
 	}
 	if command.HasValue && c.config.maxItemSize > 0 && len(command.Value) > c.config.maxItemSize {
-		return RawResponse{}, fmt.Errorf("memcache: value exceeds configured maximum of %d bytes", c.config.maxItemSize)
+		return RawResponse{}, &usageError{fmt.Errorf("memcache: value exceeds configured maximum of %d bytes", c.config.maxItemSize)}
 	}
 	data, err := command.marshal()
 	if err != nil {
-		return RawResponse{}, err
+		return RawResponse{}, &usageError{err}
 	}
 	server, err := c.server(command.Key)
 	if err != nil {
-		return RawResponse{}, err
+		return RawResponse{}, &usageError{err}
 	}
 	responses, written, err := server.exchange(ctx, data, func(RawResponse) bool { return true })
 	if err != nil {
@@ -229,32 +281,6 @@ func buildGet(key string, options GetOptions) (MetaCommand, error) {
 	return MetaCommand{Command: "mg", Key: key, Flags: flags}, err
 }
 
-// Get reads a value and maps a miss to ErrCacheMiss. A value marked stale by
-// memcached is still returned; use GetWithOptions to inspect its ValueState.
-func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
-	result, err := c.GetWithOptions(ctx, key, GetOptions{})
-	if err != nil {
-		return nil, err
-	}
-	if result.Status != GetHit {
-		return nil, ErrCacheMiss
-	}
-	return result.Value, nil
-}
-
-// GetWithOptions performs a semantic meta get.
-func (c *Client) GetWithOptions(ctx context.Context, key string, options GetOptions) (GetResult, error) {
-	command, err := buildGet(key, options)
-	if err != nil {
-		return GetResult{}, err
-	}
-	wire, err := c.ExecuteMeta(ctx, command)
-	if err != nil {
-		return GetResult{}, err
-	}
-	return semanticGet(key, options, wire)
-}
-
 func semanticGet(key string, options GetOptions, wire RawResponse) (GetResult, error) {
 	result := GetResult{Key: key, Metadata: wire.Metadata, ValueState: ValueFresh, Lease: LeaseNone, ReturnedKey: wire.Key, Opaque: wire.Opaque}
 	switch wire.Code {
@@ -294,11 +320,6 @@ func semanticGet(key string, options GetOptions, wire RawResponse) (GetResult, e
 		return GetResult{}, &ProtocolError{Message: fmt.Sprintf("unexpected get response %q", wire.Code)}
 	}
 	return result, nil
-}
-
-// Inspect returns metadata without fetching the value.
-func (c *Client) Inspect(ctx context.Context, key string) (GetResult, error) {
-	return c.GetWithOptions(ctx, key, GetOptions{MetadataOnly: true, ReturnCAS: true, ReturnTTL: true, ReturnSize: true, ReturnLastAccess: true, ReturnHitBefore: true})
 }
 
 func modeFlag(mode StoreMode) (string, error) {
@@ -371,32 +392,6 @@ func buildSet(key string, value []byte, options SetOptions) (MetaCommand, error)
 	return MetaCommand{Command: "ms", Key: key, Flags: flags, Value: value, HasValue: true}, err
 }
 
-// Set unconditionally stores bytes with the supplied expiration.
-func (c *Client) Set(ctx context.Context, key string, value []byte, expiration Expiration) error {
-	result, err := c.Store(ctx, key, value, SetOptions{TTL: expiration})
-	if err != nil {
-		return err
-	}
-	if !result.Applied() {
-		return mutationError(result.Status)
-	}
-	return nil
-}
-
-// Store performs a configurable meta set.
-func (c *Client) Store(ctx context.Context, key string, value []byte, options SetOptions) (MutationResult, error) {
-	command, err := buildSet(key, value, options)
-	if err != nil {
-		return MutationResult{}, err
-	}
-	wire, err := c.ExecuteMeta(ctx, command)
-	if err != nil {
-		return MutationResult{}, err
-	}
-	status, err := storeStatus(wire.Code, options.Mode)
-	return MutationResult{Key: key, Status: status, CAS: wire.Metadata.CAS, Size: wire.Metadata.Size, ReturnedKey: wire.Key, Opaque: wire.Opaque}, err
-}
-
 func storeStatus(code ResponseCode, mode StoreMode) (MutationStatus, error) {
 	switch code {
 	case ResponseHeader:
@@ -441,47 +436,6 @@ func arithmeticStatus(code ResponseCode) (MutationStatus, error) {
 	}
 }
 
-func mutationError(status MutationStatus) error {
-	switch status {
-	case MutationNotFound:
-		return ErrCacheMiss
-	case MutationCASMismatch:
-		return ErrCASMismatch
-	default:
-		return ErrNotStored
-	}
-}
-
-// Add stores only when key is absent.
-func (c *Client) Add(ctx context.Context, key string, value []byte, expiration Expiration) (bool, error) {
-	r, err := c.Store(ctx, key, value, SetOptions{TTL: expiration, Mode: ModeAdd})
-	return err == nil && r.Applied(), err
-}
-
-// Replace stores only when key exists.
-func (c *Client) Replace(ctx context.Context, key string, value []byte, expiration Expiration) (bool, error) {
-	r, err := c.Store(ctx, key, value, SetOptions{TTL: expiration, Mode: ModeReplace})
-	return err == nil && r.Applied(), err
-}
-
-// Append atomically appends raw bytes to an existing value.
-func (c *Client) Append(ctx context.Context, key string, value []byte) (bool, error) {
-	r, err := c.Store(ctx, key, value, SetOptions{Mode: ModeAppend})
-	return err == nil && r.Applied(), err
-}
-
-// Prepend atomically prepends raw bytes to an existing value.
-func (c *Client) Prepend(ctx context.Context, key string, value []byte) (bool, error) {
-	r, err := c.Store(ctx, key, value, SetOptions{Mode: ModePrepend})
-	return err == nil && r.Applied(), err
-}
-
-// CompareAndSwap stores only if cas matches.
-func (c *Client) CompareAndSwap(ctx context.Context, key string, value []byte, expiration Expiration, cas uint64) (bool, error) {
-	r, err := c.Store(ctx, key, value, SetOptions{TTL: expiration, CompareCAS: &cas})
-	return err == nil && r.Applied(), err
-}
-
 func buildDelete(key string, options DeleteOptions) (MetaCommand, error) {
 	if options.StaleFor != nil && !options.Invalidate {
 		return MetaCommand{}, fmt.Errorf("memcache: StaleFor requires Invalidate")
@@ -508,42 +462,6 @@ func buildDelete(key string, options DeleteOptions) (MetaCommand, error) {
 	var err error
 	flags, err = appendOpaque(flags, options.Opaque)
 	return MetaCommand{Command: "md", Key: key, Flags: flags}, err
-}
-
-// Delete removes a key. Missing keys are reported as (false, nil).
-func (c *Client) Delete(ctx context.Context, key string) (bool, error) {
-	r, err := c.DeleteWithOptions(ctx, key, DeleteOptions{})
-	return err == nil && r.Applied(), err
-}
-
-// DeleteWithOptions performs a configurable meta delete or stale invalidation.
-func (c *Client) DeleteWithOptions(ctx context.Context, key string, options DeleteOptions) (MutationResult, error) {
-	command, err := buildDelete(key, options)
-	if err != nil {
-		return MutationResult{}, err
-	}
-	wire, err := c.ExecuteMeta(ctx, command)
-	if err != nil {
-		return MutationResult{}, err
-	}
-	status, err := deleteStatus(wire.Code)
-	return MutationResult{Key: key, Status: status, CAS: wire.Metadata.CAS, Size: wire.Metadata.Size, ReturnedKey: wire.Key, Opaque: wire.Opaque}, err
-}
-
-// Invalidate marks an existing value stale while retaining it for the given
-// duration. A missing key is reported as (false, nil).
-func (c *Client) Invalidate(ctx context.Context, key string, staleFor Expiration) (bool, error) {
-	r, err := c.DeleteWithOptions(ctx, key, DeleteOptions{Invalidate: true, StaleFor: &staleFor})
-	return err == nil && r.Applied(), err
-}
-
-// FulfillLease stores a refreshed value using the CAS token returned to a
-// lease winner. It rejects results that did not grant a lease.
-func (c *Client) FulfillLease(ctx context.Context, lease GetResult, value []byte, expiration Expiration) (MutationResult, error) {
-	if lease.Lease != LeaseGranted || lease.Metadata.CAS == nil {
-		return MutationResult{}, fmt.Errorf("memcache: only a lease winner with CAS may fulfill a lease")
-	}
-	return c.Store(ctx, lease.Key, value, SetOptions{TTL: expiration, CompareCAS: lease.Metadata.CAS})
 }
 
 func buildArithmetic(key string, options ArithmeticOptions) (MetaCommand, error) {
@@ -586,19 +504,6 @@ func buildArithmetic(key string, options ArithmeticOptions) (MetaCommand, error)
 	return MetaCommand{Command: "ma", Key: key, Flags: flags}, err
 }
 
-// Arithmetic performs configurable unsigned 64-bit meta arithmetic.
-func (c *Client) Arithmetic(ctx context.Context, key string, options ArithmeticOptions) (ArithmeticResult, error) {
-	command, err := buildArithmetic(key, options)
-	if err != nil {
-		return ArithmeticResult{}, err
-	}
-	wire, err := c.ExecuteMeta(ctx, command)
-	if err != nil {
-		return ArithmeticResult{}, err
-	}
-	return semanticArithmetic(key, options, wire)
-}
-
 func semanticArithmetic(key string, options ArithmeticOptions, wire RawResponse) (ArithmeticResult, error) {
 	status, err := arithmeticStatus(wire.Code)
 	result := ArithmeticResult{Key: key, Status: status, Metadata: wire.Metadata, ReturnedKey: wire.Key, Opaque: wire.Opaque}
@@ -618,98 +523,4 @@ func semanticArithmetic(key string, options ArithmeticOptions, wire RawResponse)
 		result.Value, result.HasValue = value, true
 	}
 	return result, err
-}
-
-// Increment adds delta to an existing unsigned decimal value.
-func (c *Client) Increment(ctx context.Context, key string, delta uint64) (uint64, error) {
-	r, err := c.Arithmetic(ctx, key, ArithmeticOptions{Delta: delta})
-	if err != nil {
-		return 0, err
-	}
-	if !r.HasValue {
-		return 0, mutationError(r.Status)
-	}
-	return r.Value, nil
-}
-
-// Decrement subtracts delta from an existing unsigned decimal value, flooring
-// the result at zero.
-func (c *Client) Decrement(ctx context.Context, key string, delta uint64) (uint64, error) {
-	r, err := c.Arithmetic(ctx, key, ArithmeticOptions{Delta: delta, Decrement: true})
-	if err != nil {
-		return 0, err
-	}
-	if !r.HasValue {
-		return 0, mutationError(r.Status)
-	}
-	return r.Value, nil
-}
-
-// Touch updates a key's expiration without fetching its value.
-func (c *Client) Touch(ctx context.Context, key string, expiration Expiration) (bool, error) {
-	r, err := c.GetWithOptions(ctx, key, GetOptions{MetadataOnly: true, Touch: &expiration})
-	return err == nil && r.Status == GetHit, err
-}
-
-// Debug returns the me command's internal key/value metadata.
-func (c *Client) Debug(ctx context.Context, key string) (map[string]string, error) {
-	wire, err := c.ExecuteMeta(ctx, MetaCommand{Command: "me", Key: key})
-	if err != nil {
-		return nil, err
-	}
-	if wire.Code == ResponseMiss {
-		return nil, ErrCacheMiss
-	}
-	if wire.Code != ResponseDebug {
-		return nil, &ProtocolError{Message: "unexpected debug response"}
-	}
-	return wire.Debug, nil
-}
-
-// GetInto decodes a cached value using the configured Codec. A value marked
-// stale by memcached is still decoded; use GetWithOptions to inspect its
-// ValueState before decoding when freshness matters.
-func (c *Client) GetInto(ctx context.Context, key string, destination any) error {
-	result, err := c.GetWithOptions(ctx, key, GetOptions{ReturnClientFlags: true})
-	if err != nil {
-		return err
-	}
-	if result.Status != GetHit {
-		return ErrCacheMiss
-	}
-	flags := uint32(0)
-	if result.Metadata.ClientFlags != nil {
-		flags = *result.Metadata.ClientFlags
-	}
-	return c.config.codec.Unmarshal(result.Value, flags, destination)
-}
-
-// SetValue encodes and stores an application value using the configured Codec.
-func (c *Client) SetValue(ctx context.Context, key string, value any, expiration Expiration) error {
-	data, flags, err := c.config.codec.Marshal(value)
-	if err != nil {
-		return err
-	}
-	result, err := c.Store(ctx, key, data, SetOptions{TTL: expiration, ClientFlags: flags})
-	if err != nil {
-		return err
-	}
-	if !result.Applied() {
-		return mutationError(result.Status)
-	}
-	return nil
-}
-
-// Noop checks every configured backend with the meta no-op command.
-func (c *Client) Noop(ctx context.Context) error {
-	for _, server := range c.servers {
-		responses, _, err := server.exchange(ctx, []byte("mn\r\n"), func(r RawResponse) bool { return r.Code == ResponseNoop })
-		if err != nil {
-			return err
-		}
-		if len(responses) != 1 || responses[0].Code != ResponseNoop {
-			return &ProtocolError{Message: "unexpected no-op response"}
-		}
-	}
-	return nil
 }

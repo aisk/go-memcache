@@ -1,0 +1,251 @@
+package memcache
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// Compile-time proof of the option placement matrix: each policy option
+// implements exactly the verb interfaces the design table grants it.
+var (
+	_ PolicyOption   = TTL(0)
+	_ SetOption      = TTL(0)
+	_ FetchOption    = TTL(0)
+	_ UpdateOption   = TTL(0)
+	_ GetTouchOption = TTL(0)
+
+	_ PolicyOption = RefreshAhead(time.Second)
+	_ FetchOption  = RefreshAhead(time.Second)
+
+	_ PolicyOption  = Window(time.Second)
+	_ CounterOption = Window(time.Second)
+	_ StreamOption  = Window(time.Second)
+
+	_ PolicyOption = Degrade(true)
+	_ PolicyOption = OnError(func(error) {})
+
+	_ Option = WithTimeout(time.Second)
+)
+
+func TestEngineOptionsAreNotPolicyOptions(t *testing.T) {
+	if _, ok := any(WithTimeout(time.Second)).(PolicyOption); ok {
+		t.Fatal("an engine option must not double as a policy default")
+	}
+}
+
+func TestPolicyResolutionErrors(t *testing.T) {
+	client, err := New("unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	loader := func(context.Context) ([]byte, error) { return []byte("x"), nil }
+	transform := func([]byte, bool) ([]byte, error) { return []byte("x"), nil }
+	needTTL := map[string]func() error{
+		"Set":      func() error { return client.Set(ctx, "k", []byte("v")) },
+		"SetMany":  func() error { return client.SetMany(ctx, map[string][]byte{"k": []byte("v")}) },
+		"Add":      func() error { _, err := client.Add(ctx, "k", []byte("v")); return err },
+		"Replace":  func() error { _, err := client.Replace(ctx, "k", []byte("v")); return err },
+		"Fetch":    func() error { _, err := client.Fetch(ctx, "k", loader); return err },
+		"Update":   func() error { _, err := client.Update(ctx, "k", transform); return err },
+		"GetTouch": func() error { _, _, err := client.GetTouch(ctx, "k"); return err },
+	}
+	for name, call := range needTTL {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "no TTL") {
+			t.Errorf("%s without TTL: %v", name, err)
+		}
+	}
+	needWindow := map[string]func() error{
+		"Incr":    func() error { _, err := client.Incr(ctx, "k", 1); return err },
+		"Decr":    func() error { _, err := client.Decr(ctx, "k", 1); return err },
+		"Append":  func() error { return client.Append(ctx, "k", []byte("v")) },
+		"Prepend": func() error { return client.Prepend(ctx, "k", []byte("v")) },
+	}
+	for name, call := range needWindow {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "no Window") {
+			t.Errorf("%s without Window: %v", name, err)
+		}
+	}
+}
+
+func TestConstructorRejectsInvalidPolicyDefaults(t *testing.T) {
+	for name, option := range map[string]Option{
+		"negative TTL":      TTL(-time.Second),
+		"zero RefreshAhead": RefreshAhead(0),
+		"zero Window":       Window(0),
+		"nil OnError":       OnError(nil),
+	} {
+		if _, err := New("unused", option); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}
+
+func TestEmptyValuesAreRejectedByWrites(t *testing.T) {
+	client, err := New("unused", TTL(time.Minute), Window(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	writes := map[string]func() error{
+		"Set":     func() error { return client.Set(ctx, "k", nil) },
+		"SetMany": func() error { return client.SetMany(ctx, map[string][]byte{"k": {}}) },
+		"Add":     func() error { _, err := client.Add(ctx, "k", nil); return err },
+		"Replace": func() error { _, err := client.Replace(ctx, "k", nil); return err },
+		"Append":  func() error { return client.Append(ctx, "k", nil) },
+		"Prepend": func() error { return client.Prepend(ctx, "k", nil) },
+	}
+	for name, call := range writes {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "empty") {
+			t.Errorf("%s accepted an empty value: %v", name, err)
+		}
+	}
+}
+
+// Degrade never absorbs an ambiguous write: degrading covers "the cache is
+// unavailable", not "the write may or may not have landed".
+func TestDegradeNeverAbsorbsAmbiguousWrites(t *testing.T) {
+	client, err := New("unused", Degrade(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ambiguous := &AmbiguousWriteError{Operation: "ms", Key: "k", Cause: errors.New("connection lost")}
+	if client.absorb(ctx, ambiguous) {
+		t.Fatal("ambiguous write was absorbed")
+	}
+	if !client.absorb(ctx, errors.New("cache down")) {
+		t.Fatal("plain infrastructure failure was not absorbed")
+	}
+}
+
+// Degrade absorbs only infrastructure failures: a permanent client-side
+// mistake or the caller's own cancellation must surface instead of turning
+// into a silent fake result on every call.
+func TestDegradeSurfacesUsageErrorsAndCancellation(t *testing.T) {
+	client, err := New("127.0.0.1:1",
+		WithDialTimeout(100*time.Millisecond),
+		Degrade(true),
+		TTL(time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := context.Background()
+
+	oversized := make([]byte, 2<<20)
+	if err := client.Set(ctx, "k", oversized); err == nil || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("oversized set was absorbed: %v", err)
+	}
+	longKey := strings.Repeat("k", 300)
+	if _, _, err := client.Get(ctx, longKey); err == nil || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("over-long key was absorbed: %v", err)
+	}
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err := client.Get(canceled, "k"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled read was absorbed: %v", err)
+	}
+	if err := client.Set(canceled, "k", []byte("v")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled write was absorbed: %v", err)
+	}
+}
+
+// RefreshAhead at or beyond the TTL would put every write-back already inside
+// the refresh window, recomputing forever under steady reads.
+func TestFetchRejectsRefreshAheadBeyondTTL(t *testing.T) {
+	client, err := New("unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loader := func(context.Context) ([]byte, error) { return []byte("x"), nil }
+	_, err = client.Fetch(context.Background(), "k", loader, TTL(10*time.Second), RefreshAhead(30*time.Second))
+	if err == nil || !strings.Contains(err.Error(), "RefreshAhead") {
+		t.Fatalf("oversized refresh window was accepted: %v", err)
+	}
+}
+
+// A dead backend address is a real infrastructure failure; no mock needed.
+func TestDegradePolicyAgainstDeadBackend(t *testing.T) {
+	var hooks atomic.Int32
+	client, err := New("127.0.0.1:1",
+		WithDialTimeout(100*time.Millisecond),
+		Degrade(true),
+		OnError(func(error) { hooks.Add(1) }),
+		TTL(time.Minute),
+		Window(time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := context.Background()
+
+	// Reads degrade into a miss.
+	if _, ok, err := client.Get(ctx, "k"); err != nil || ok {
+		t.Fatalf("degraded get: ok=%v err=%v", ok, err)
+	}
+	if found, err := client.GetMany(ctx, []string{"a", "b"}); err != nil || len(found) != 0 {
+		t.Fatalf("degraded get many: %#v, %v", found, err)
+	}
+	if _, ok, err := client.GetTouch(ctx, "k"); err != nil || ok {
+		t.Fatalf("degraded get touch: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := client.Inspect(ctx, "k"); err != nil || ok {
+		t.Fatalf("degraded inspect: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := client.Peek(ctx, "k"); err != nil || ok {
+		t.Fatalf("degraded peek: ok=%v err=%v", ok, err)
+	}
+
+	// Unconditional writes give up silently.
+	silent := map[string]func() error{
+		"Set":        func() error { return client.Set(ctx, "k", []byte("v")) },
+		"SetMany":    func() error { return client.SetMany(ctx, map[string][]byte{"k": []byte("v")}) },
+		"Delete":     func() error { return client.Delete(ctx, "k") },
+		"DeleteMany": func() error { return client.DeleteMany(ctx, []string{"k"}) },
+		"Invalidate": func() error { return client.Invalidate(ctx, "k", time.Minute) },
+		"Touch":      func() error { return client.Touch(ctx, "k", time.Minute) },
+		"Append":     func() error { return client.Append(ctx, "k", []byte("v")) },
+		"Prepend":    func() error { return client.Prepend(ctx, "k", []byte("v")) },
+	}
+	for name, call := range silent {
+		if err := call(); err != nil {
+			t.Errorf("degraded %s: %v", name, err)
+		}
+	}
+
+	// Verbs whose answer feeds a business decision keep failing loudly.
+	loud := map[string]func() error{
+		"Add":     func() error { _, err := client.Add(ctx, "k", []byte("v")); return err },
+		"Replace": func() error { _, err := client.Replace(ctx, "k", []byte("v")); return err },
+		"Incr":    func() error { _, err := client.Incr(ctx, "k", 1); return err },
+		"Decr":    func() error { _, err := client.Decr(ctx, "k", 1); return err },
+		"Drain":   func() error { _, err := client.Drain(ctx, "k"); return err },
+		"Update": func() error {
+			_, err := client.Update(ctx, "k", func([]byte, bool) ([]byte, error) { return []byte("v"), nil })
+			return err
+		},
+	}
+	for name, call := range loud {
+		if err := call(); err == nil {
+			t.Errorf("degraded %s did not surface the failure", name)
+		}
+	}
+
+	// Fetch degrades into a local computation.
+	value, err := client.Fetch(ctx, "k", func(context.Context) ([]byte, error) { return []byte("local"), nil })
+	if err != nil || string(value) != "local" {
+		t.Fatalf("degraded fetch: %q, %v", value, err)
+	}
+
+	if hooks.Load() == 0 {
+		t.Fatal("absorbed failures never reached OnError")
+	}
+}

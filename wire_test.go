@@ -204,7 +204,7 @@ func TestExecuteMetaRejectsQuietWithoutBarrier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.ExecuteMeta(context.Background(), MetaCommand{Command: "mg", Key: "key", Flags: []string{"q"}})
+	_, err = client.Meta().Execute(context.Background(), MetaCommand{Command: "mg", Key: "key", Flags: []string{"q"}})
 	if err == nil {
 		t.Fatal("quiet command was accepted")
 	}
@@ -216,7 +216,7 @@ func TestBatchRejectsTypedNilOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	var operation *GetOperation
-	if _, err := client.Batch(context.Background(), []Operation{operation}); err == nil {
+	if _, err := client.Meta().Batch(context.Background(), []Operation{operation}); err == nil {
 		t.Fatal("typed nil operation was accepted")
 	}
 }

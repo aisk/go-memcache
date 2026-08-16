@@ -33,7 +33,7 @@ func TestCancellationInterruptsRead(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { _, err := client.Get(ctx, "key"); done <- err }()
+	go func() { _, _, err := client.Get(ctx, "key"); done <- err }()
 	<-requestRead
 	cancel()
 	select {
@@ -60,7 +60,7 @@ func TestCanceledMutationIsAmbiguous(t *testing.T) {
 	client, _ := New("pipe", WithDialer(dial), WithTimeout(0))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- client.Set(ctx, "key", []byte("x"), 0) }()
+	go func() { done <- client.Set(ctx, "key", []byte("x"), TTL(0)) }()
 	<-requestRead
 	cancel()
 	err := <-done
@@ -90,7 +90,7 @@ func TestPartialCommandWriteIsNotAmbiguous(t *testing.T) {
 		return &partialWriteConn{Conn: client, limit: 1}, nil
 	}
 	client, _ := New("pipe", WithDialer(dial))
-	err := client.Set(context.Background(), "key", []byte("value"), 0)
+	err := client.Set(context.Background(), "key", []byte("value"), TTL(0))
 	var ambiguous *AmbiguousWriteError
 	if err == nil || errors.As(err, &ambiguous) {
 		t.Fatalf("got %T %v", err, err)
@@ -109,7 +109,7 @@ func TestCanceledMutatingGetIsAmbiguous(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	ttl := Expiration(30)
-	go func() { _, err := client.GetWithOptions(ctx, "key", GetOptions{Touch: &ttl}); done <- err }()
+	go func() { _, err := client.Meta().Get(ctx, "key", GetOptions{Touch: &ttl}); done <- err }()
 	<-requestRead
 	cancel()
 	err := <-done
@@ -132,14 +132,14 @@ func TestFramingFailureDiscardsConnection(t *testing.T) {
 		_, _ = conn.Write([]byte("EN\r\n"))
 	})
 	client, _ := New("pipe", WithDialer(dial))
-	_, err := client.Get(context.Background(), "one")
+	_, _, err := client.Get(context.Background(), "one")
 	var protocol *ProtocolError
 	if !errors.As(err, &protocol) {
 		t.Fatalf("first get: %v", err)
 	}
-	_, err = client.Get(context.Background(), "two")
-	if !errors.Is(err, ErrCacheMiss) {
-		t.Fatalf("second get: %v", err)
+	_, ok, err := client.Get(context.Background(), "two")
+	if err != nil || ok {
+		t.Fatalf("second get: ok=%v err=%v", ok, err)
 	}
 	if dials.Load() != 2 {
 		t.Fatalf("dials = %d, want 2", dials.Load())
@@ -163,15 +163,15 @@ func TestFramedFlagErrorIsKnownAndConnectionReusable(t *testing.T) {
 		return client, nil
 	}
 	client, _ := New("pipe", WithDialer(dial))
-	err := client.Set(context.Background(), "one", []byte("x"), 0)
+	err := client.Set(context.Background(), "one", []byte("x"), TTL(0))
 	var ambiguous *AmbiguousWriteError
 	var protocol *ProtocolError
 	if errors.As(err, &ambiguous) || !errors.As(err, &protocol) {
 		t.Fatalf("set error = %T %v", err, err)
 	}
-	_, err = client.Get(context.Background(), "two")
-	if !errors.Is(err, ErrCacheMiss) {
-		t.Fatalf("second get: %v", err)
+	_, ok, err := client.Get(context.Background(), "two")
+	if err != nil || ok {
+		t.Fatalf("second get: ok=%v err=%v", ok, err)
 	}
 	if dials.Load() != 1 {
 		t.Fatalf("dials = %d, want connection reuse", dials.Load())
@@ -194,7 +194,7 @@ func TestPipelineReadsWhileWriting(t *testing.T) {
 		_, _ = conn.Write([]byte("MN\r\n"))
 	})
 	client, _ := New("pipe", WithDialer(dial), WithTimeout(time.Second))
-	results, err := client.Batch(context.Background(), []Operation{
+	results, err := client.Meta().Batch(context.Background(), []Operation{
 		GetOperation{Key: "hit"},
 		SetOperation{Key: "large", Value: large},
 	})
@@ -219,7 +219,7 @@ func TestMissingRequiredBatchResponseIsAmbiguous(t *testing.T) {
 		_, _ = conn.Write([]byte("MN\r\n"))
 	})
 	client, _ := New("pipe", WithDialer(dial))
-	results, err := client.Batch(context.Background(), []Operation{
+	results, err := client.Meta().Batch(context.Background(), []Operation{
 		SetOperation{Key: "key", Value: []byte("x"), Options: SetOptions{ReturnCAS: true}},
 	})
 	if err != nil {
@@ -241,7 +241,7 @@ func TestMissingVivifyResponseIsAmbiguous(t *testing.T) {
 	})
 	client, _ := New("pipe", WithDialer(dial))
 	ttl := Expiration(30)
-	results, err := client.Batch(context.Background(), []Operation{
+	results, err := client.Meta().Batch(context.Background(), []Operation{
 		GetOperation{Key: "key", Options: GetOptions{VivifyTTL: &ttl}},
 	})
 	if err != nil {
@@ -263,7 +263,7 @@ func TestDuplicateOpaqueMutationIsAmbiguous(t *testing.T) {
 		_, _ = conn.Write([]byte("HD O0\r\nHD O0\r\nMN\r\n"))
 	})
 	client, _ := New("pipe", WithDialer(dial))
-	results, err := client.Batch(context.Background(), []Operation{SetOperation{Key: "key", Value: []byte("x")}})
+	results, err := client.Meta().Batch(context.Background(), []Operation{SetOperation{Key: "key", Value: []byte("x")}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,8 +294,8 @@ func TestPoolReuseAndClose(t *testing.T) {
 	}
 	client, _ := New("pipe", WithDialer(dial), WithMaxIdleConns(1))
 	for range 2 {
-		if _, err := client.Get(context.Background(), "key"); !errors.Is(err, ErrCacheMiss) {
-			t.Fatal(err)
+		if _, ok, err := client.Get(context.Background(), "key"); err != nil || ok {
+			t.Fatalf("ok=%v err=%v", ok, err)
 		}
 	}
 	if dials.Load() != 1 {
@@ -304,7 +304,7 @@ func TestPoolReuseAndClose(t *testing.T) {
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Get(context.Background(), "key"); !errors.Is(err, ErrClosed) {
+	if _, _, err := client.Get(context.Background(), "key"); !errors.Is(err, ErrClosed) {
 		t.Fatalf("after Close: %v", err)
 	}
 }
@@ -404,8 +404,8 @@ func TestIdleTimeoutRedials(t *testing.T) {
 	client, _ := New("pipe", WithDialer(dial), WithIdleTimeout(10*time.Millisecond))
 	get := func(want int32) {
 		t.Helper()
-		if _, err := client.Get(context.Background(), "key"); !errors.Is(err, ErrCacheMiss) {
-			t.Fatal(err)
+		if _, ok, err := client.Get(context.Background(), "key"); err != nil || ok {
+			t.Fatalf("ok=%v err=%v", ok, err)
 		}
 		if dials.Load() != want {
 			t.Fatalf("dials = %d, want %d", dials.Load(), want)
@@ -431,7 +431,7 @@ func TestMaxIdleZeroDisablesReuse(t *testing.T) {
 	}
 	client, _ := New("pipe", WithDialer(dial), WithMaxIdleConns(0))
 	for range 2 {
-		_, _ = client.Get(context.Background(), "key")
+		_, _, _ = client.Get(context.Background(), "key")
 	}
 	if dials.Load() != 2 {
 		t.Fatalf("dials = %d, want 2", dials.Load())
