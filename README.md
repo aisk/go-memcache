@@ -20,7 +20,7 @@ if err != nil { /* handle */ }
 defer mc.Close()
 ```
 
-With multiple servers, keys are distributed by stable rendezvous hashing and `WithRouter` replaces the routing. Each server has an elastic connection pool. `WithMaxIdleConns` limits retained idle connections (not active requests) and idle connections are redialed after `WithIdleTimeout` (90 seconds by default).
+With multiple servers, keys are distributed by stable rendezvous hashing and `WithRouter` replaces the routing. Each server gets one multiplexed connection. Commands issued concurrently are queued on it, written in a single flush and answered in order, so N goroutines talking to one server pay one round trip on one socket, not N of each. `WithMaxConns` allows more connections per server, and a further one is dialed only while every existing one has commands in flight. A connection with nothing in flight is closed after `WithIdleTimeout` (90 seconds by default) and redialed on demand.
 
 Other options are `WithTimeout` (per request), `WithDialTimeout`, `WithNetwork`, `WithDialer`, `WithMaxItemSize`, plus the policy options `WithCodec`, `Degrade`, `OnError` and a client wide `RefreshAhead` default described below.
 

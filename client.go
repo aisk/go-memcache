@@ -70,6 +70,9 @@ func New(server string, options ...Option) (*Client, error) {
 	}
 	// Created after validation so no error path leaks the cancelable context.
 	client.rootCtx, client.cancelRoot = context.WithCancel(context.Background())
+	for _, server := range client.servers {
+		server.ctx = client.rootCtx
+	}
 	return client, nil
 }
 
@@ -110,8 +113,9 @@ func (c *Client) server(key string) (*serverPool, error) {
 }
 
 // Close cancels background refreshes and any in-flight Fetch loaders,
-// releases idle connections, and prevents new work. Requests already on the
-// wire finish their exchange. Close is idempotent.
+// closes connections, and prevents new work. Requests already on the wire
+// finish their exchange before their connection closes; queued ones fail
+// with ErrClosed. Close is idempotent.
 func (c *Client) Close() error {
 	c.close.Do(func() {
 		c.cancelRoot()
@@ -176,18 +180,22 @@ func (c *Client) executeMeta(ctx context.Context, command MetaCommand) (RawRespo
 	}
 	responses, written, err := server.exchange(ctx, data, func(RawResponse) bool { return true })
 	if err != nil {
+		// A server error line is a definite outcome. Anything else that
+		// arrives after the whole command reached the wire leaves a
+		// side-effecting command's outcome unknown.
 		var serverErr *ServerError
 		if errors.As(err, &serverErr) {
 			return RawResponse{}, err
-		}
-		var framed *framedResponseError
-		if errors.As(err, &framed) {
-			return RawResponse{}, framed.err
 		}
 		if written == len(data) && commandHasSideEffect(command) {
 			return RawResponse{}, &AmbiguousWriteError{Operation: command.Command, Key: command.Key, Cause: err}
 		}
 		return RawResponse{}, err
+	}
+	if responses[0].parseErr != nil {
+		// The frame was consumed intact, so the outcome is known even
+		// though a flag in it was unreadable.
+		return RawResponse{}, responses[0].parseErr
 	}
 	return responses[0], nil
 }
