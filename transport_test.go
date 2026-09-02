@@ -33,7 +33,7 @@ func TestCancellationInterruptsRead(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { _, _, err := client.Get(ctx, "key"); done <- err }()
+	go func() { _, _, err := client.Get[[]byte](ctx, "key"); done <- err }()
 	<-requestRead
 	cancel()
 	select {
@@ -132,12 +132,12 @@ func TestFramingFailureDiscardsConnection(t *testing.T) {
 		_, _ = conn.Write([]byte("EN\r\n"))
 	})
 	client, _ := New("pipe", WithDialer(dial))
-	_, _, err := client.Get(context.Background(), "one")
+	_, _, err := client.Get[[]byte](context.Background(), "one")
 	var protocol *ProtocolError
 	if !errors.As(err, &protocol) {
 		t.Fatalf("first get: %v", err)
 	}
-	_, ok, err := client.Get(context.Background(), "two")
+	_, ok, err := client.Get[[]byte](context.Background(), "two")
 	if err != nil || ok {
 		t.Fatalf("second get: ok=%v err=%v", ok, err)
 	}
@@ -169,7 +169,7 @@ func TestFramedFlagErrorIsKnownAndConnectionReusable(t *testing.T) {
 	if errors.As(err, &ambiguous) || !errors.As(err, &protocol) {
 		t.Fatalf("set error = %T %v", err, err)
 	}
-	_, ok, err := client.Get(context.Background(), "two")
+	_, ok, err := client.Get[[]byte](context.Background(), "two")
 	if err != nil || ok {
 		t.Fatalf("second get: ok=%v err=%v", ok, err)
 	}
@@ -294,7 +294,7 @@ func TestPoolReuseAndClose(t *testing.T) {
 	}
 	client, _ := New("pipe", WithDialer(dial), WithMaxIdleConns(1))
 	for range 2 {
-		if _, ok, err := client.Get(context.Background(), "key"); err != nil || ok {
+		if _, ok, err := client.Get[[]byte](context.Background(), "key"); err != nil || ok {
 			t.Fatalf("ok=%v err=%v", ok, err)
 		}
 	}
@@ -304,7 +304,7 @@ func TestPoolReuseAndClose(t *testing.T) {
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := client.Get(context.Background(), "key"); !errors.Is(err, ErrClosed) {
+	if _, _, err := client.Get[[]byte](context.Background(), "key"); !errors.Is(err, ErrClosed) {
 		t.Fatalf("after Close: %v", err)
 	}
 }
@@ -404,7 +404,7 @@ func TestIdleTimeoutRedials(t *testing.T) {
 	client, _ := New("pipe", WithDialer(dial), WithIdleTimeout(10*time.Millisecond))
 	get := func(want int32) {
 		t.Helper()
-		if _, ok, err := client.Get(context.Background(), "key"); err != nil || ok {
+		if _, ok, err := client.Get[[]byte](context.Background(), "key"); err != nil || ok {
 			t.Fatalf("ok=%v err=%v", ok, err)
 		}
 		if dials.Load() != want {
@@ -431,7 +431,7 @@ func TestMaxIdleZeroDisablesReuse(t *testing.T) {
 	}
 	client, _ := New("pipe", WithDialer(dial), WithMaxIdleConns(0))
 	for range 2 {
-		_, _, _ = client.Get(context.Background(), "key")
+		_, _, _ = client.Get[[]byte](context.Background(), "key")
 	}
 	if dials.Load() != 2 {
 		t.Fatalf("dials = %d, want 2", dials.Load())

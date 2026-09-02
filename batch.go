@@ -109,28 +109,23 @@ func normalizeOperation(operation Operation) (Operation, error) {
 	case GetOperation, SetOperation, DeleteOperation, ArithmeticOperation:
 		return operation, nil
 	case *GetOperation:
-		if op == nil {
-			return nil, fmt.Errorf("nil *GetOperation")
-		}
-		return *op, nil
+		return derefOperation(op)
 	case *SetOperation:
-		if op == nil {
-			return nil, fmt.Errorf("nil *SetOperation")
-		}
-		return *op, nil
+		return derefOperation(op)
 	case *DeleteOperation:
-		if op == nil {
-			return nil, fmt.Errorf("nil *DeleteOperation")
-		}
-		return *op, nil
+		return derefOperation(op)
 	case *ArithmeticOperation:
-		if op == nil {
-			return nil, fmt.Errorf("nil *ArithmeticOperation")
-		}
-		return *op, nil
+		return derefOperation(op)
 	default:
 		return nil, fmt.Errorf("unsupported operation %T", operation)
 	}
+}
+
+func derefOperation[T Operation](op *T) (Operation, error) {
+	if op == nil {
+		return nil, fmt.Errorf("nil %T", op)
+	}
+	return *op, nil
 }
 
 func quietCommand(item preparedOperation) MetaCommand {

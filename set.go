@@ -20,16 +20,21 @@ func (c *Client) doSet(ctx context.Context, key string, value []byte, options Me
 }
 
 // Set unconditionally stores a value for ttl. Storing without expiration is
-// the explicit choice Forever.
-func (c *Client) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+// the explicit choice Forever. The value is encoded with the client's codec;
+// a []byte value is stored as is.
+func (c *Client) Set[T any](ctx context.Context, key string, value T, ttl time.Duration) error {
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return err
 	}
-	if len(value) == 0 {
+	data, err := c.encode(value)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 {
 		return errEmptyValue
 	}
-	status, err := c.doSet(ctx, key, value, MetaSetOptions{TTL: expiration})
+	status, err := c.doSet(ctx, key, data, MetaSetOptions{TTL: expiration})
 	if err != nil {
 		if c.absorb(ctx, err) {
 			return nil
@@ -44,17 +49,21 @@ func (c *Client) Set(ctx context.Context, key string, value []byte, ttl time.Dur
 
 // SetMany stores a set of values in one round trip per backend, all sharing
 // the same ttl.
-func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, ttl time.Duration) error {
+func (c *Client) SetMany[T any](ctx context.Context, mapping map[string]T, ttl time.Duration) error {
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return err
 	}
 	operations := make([]Operation, 0, len(mapping))
 	for key, value := range mapping {
-		if len(value) == 0 {
+		data, err := c.encode(value)
+		if err != nil {
+			return fmt.Errorf("memcache: value for %q: %w", key, err)
+		}
+		if len(data) == 0 {
 			return fmt.Errorf("memcache: value for %q: %w", key, errEmptyValue)
 		}
-		operations = append(operations, SetOperation{Key: key, Value: value, Options: MetaSetOptions{TTL: expiration}})
+		operations = append(operations, SetOperation{Key: key, Value: data, Options: MetaSetOptions{TTL: expiration}})
 	}
 	results, err := c.batch(ctx, operations)
 	if err != nil {
@@ -72,15 +81,19 @@ func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, ttl tim
 // Add stores only when the key is absent and reports whether this caller won.
 // The bool is the caller's whole answer, so Add keeps it; it is also why
 // Degrade never fakes a result here.
-func (c *Client) Add(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+func (c *Client) Add[T any](ctx context.Context, key string, value T, ttl time.Duration) (bool, error) {
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return false, err
 	}
-	if len(value) == 0 {
+	data, err := c.encode(value)
+	if err != nil {
+		return false, err
+	}
+	if len(data) == 0 {
 		return false, errEmptyValue
 	}
-	status, err := c.doSet(ctx, key, value, MetaSetOptions{TTL: expiration, Mode: ModeAdd})
+	status, err := c.doSet(ctx, key, data, MetaSetOptions{TTL: expiration, Mode: ModeAdd})
 	if err != nil {
 		return false, err
 	}
@@ -90,15 +103,19 @@ func (c *Client) Add(ctx context.Context, key string, value []byte, ttl time.Dur
 // Replace stores only when the key still exists and reports whether it did.
 // It is the write half of session renewal: false means the session ended
 // mid-request and there is nothing to write back to.
-func (c *Client) Replace(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+func (c *Client) Replace[T any](ctx context.Context, key string, value T, ttl time.Duration) (bool, error) {
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return false, err
 	}
-	if len(value) == 0 {
+	data, err := c.encode(value)
+	if err != nil {
+		return false, err
+	}
+	if len(data) == 0 {
 		return false, errEmptyValue
 	}
-	status, err := c.doSet(ctx, key, value, MetaSetOptions{TTL: expiration, Mode: ModeReplace})
+	status, err := c.doSet(ctx, key, data, MetaSetOptions{TTL: expiration, Mode: ModeReplace})
 	if err != nil {
 		return false, err
 	}

@@ -50,10 +50,30 @@ type fetchFlight struct {
 // The loader receives a context owned by the client (carrying the winning
 // caller's deadline on the miss path) and must not rely on request-scoped
 // values.
-func (c *Client) Fetch(ctx context.Context, key string, ttl time.Duration, loader func(context.Context) ([]byte, error), options ...FetchOption) ([]byte, error) {
+//
+// The loader's value is encoded with the client's codec before it is
+// stored, and every caller, the winner included, receives the decoded stored
+// form; a []byte value passes through untouched.
+func (c *Client) Fetch[T any](ctx context.Context, key string, ttl time.Duration, loader func(context.Context) (T, error), options ...FetchOption) (T, error) {
+	var zero T
 	if loader == nil {
-		return nil, fmt.Errorf("memcache: Fetch requires a loader")
+		return zero, fmt.Errorf("memcache: Fetch requires a loader")
 	}
+	raw, err := c.fetch(ctx, key, ttl, func(loaderCtx context.Context) ([]byte, error) {
+		value, err := loader(loaderCtx)
+		if err != nil {
+			return nil, err
+		}
+		return c.encode(value)
+	}, options...)
+	if err != nil {
+		return zero, err
+	}
+	return decode[T](c, raw)
+}
+
+// fetch is Fetch's state machine over stored bytes.
+func (c *Client) fetch(ctx context.Context, key string, ttl time.Duration, loader func(context.Context) ([]byte, error), options ...FetchOption) ([]byte, error) {
 	policy := c.config.callPolicy()
 	for _, option := range options {
 		if option == nil {

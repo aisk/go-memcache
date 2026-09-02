@@ -84,33 +84,40 @@ func (c *Client) returnStaleWin(key string, result GetResult) {
 // Get reads a value. A miss is a normal answer, not an error: ok reports
 // presence, err reports infrastructure failure, and the two never mix. A
 // value kept stale by Invalidate is returned as an ordinary hit. The Touch
-// option makes the same command also slide the hit's expiration.
-func (c *Client) Get(ctx context.Context, key string, options ...GetOption) ([]byte, bool, error) {
+// option makes the same command also slide the hit's expiration. T is
+// decoded with the client's codec; Get[[]byte] returns the raw bytes.
+func (c *Client) Get[T any](ctx context.Context, key string, options ...GetOption) (T, bool, error) {
+	var zero T
 	policy := c.config.callPolicy()
 	for _, option := range options {
 		if option == nil {
-			return nil, false, errNilOption
+			return zero, false, errNilOption
 		}
 		option.applyGet(&policy)
 	}
 	read, err := policyReadOptions(policy)
 	if err != nil {
-		return nil, false, err
+		return zero, false, err
 	}
 	result, err := c.doGet(ctx, key, read)
 	if err != nil {
-		return nil, false, err
+		return zero, false, err
 	}
 	if result.Status != GetHit || len(result.Value) == 0 {
-		return nil, false, nil
+		return zero, false, nil
 	}
-	return result.Value, true, nil
+	value, err := decode[T](c, result.Value)
+	if err != nil {
+		return zero, false, err
+	}
+	return value, true, nil
 }
 
 // GetMany reads a set of keys in one round trip per backend and returns the
 // hits; a miss is expressed by key absence. With Degrade enabled a failing
-// backend only removes its own keys from the result.
-func (c *Client) GetMany(ctx context.Context, keys []string, options ...GetOption) (map[string][]byte, error) {
+// backend only removes its own keys from the result. Values are decoded like
+// Get; a value that fails to decode is left out and reported as the error.
+func (c *Client) GetMany[T any](ctx context.Context, keys []string, options ...GetOption) (map[string]T, error) {
 	policy := c.config.callPolicy()
 	for _, option := range options {
 		if option == nil {
@@ -130,7 +137,7 @@ func (c *Client) GetMany(ctx context.Context, keys []string, options ...GetOptio
 	if err != nil {
 		return nil, err
 	}
-	found := make(map[string][]byte, len(keys))
+	found := make(map[string]T, len(keys))
 	var firstErr error
 	for i, result := range results {
 		if result.Err != nil {
@@ -145,9 +152,17 @@ func (c *Client) GetMany(ctx context.Context, keys []string, options ...GetOptio
 		if result.Get.ValueState == ValueStale && result.Get.Lease == LeaseGranted {
 			c.returnStaleWin(keys[i], *result.Get)
 		}
-		if len(result.Get.Value) > 0 {
-			found[keys[i]] = result.Get.Value
+		if len(result.Get.Value) == 0 {
+			continue
 		}
+		value, err := decode[T](c, result.Get.Value)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("memcache: %q: %w", keys[i], err)
+			}
+			continue
+		}
+		found[keys[i]] = value
 	}
 	return found, firstErr
 }
