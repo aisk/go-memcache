@@ -235,7 +235,7 @@ func (c *Client) batch(ctx context.Context, operations []Operation) ([]Operation
 		wg.Add(1)
 		go func(group batchGroup) {
 			defer wg.Done()
-			responses, written, err := c.servers[group.server].pipeline(ctx, group.payload)
+			responses, written, err := c.servers[group.server].exchange(ctx, group.payload, func(r RawResponse) bool { return r.Code == ResponseNoop })
 			outcomes <- groupOutcome{group: group, responses: responses, written: written, err: err}
 		}(group)
 	}

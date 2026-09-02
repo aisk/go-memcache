@@ -18,7 +18,7 @@ type config struct {
 	dialTimeout          time.Duration
 	ioTimeout            time.Duration
 	idleTimeout          time.Duration
-	maxIdle              int
+	maxConns             int
 	maxItemSize          int
 	router               Router
 	copyServersForRouter bool
@@ -38,7 +38,7 @@ func defaultConfig(server string) config {
 		dialTimeout: time.Second,
 		ioTimeout:   time.Second,
 		idleTimeout: 90 * time.Second,
-		maxIdle:     23,
+		maxConns:    1,
 		maxItemSize: 1024 * 1024,
 		router:      RendezvousRouter{},
 		codec:       JSONCodec{},
@@ -228,8 +228,13 @@ func WithDialer(dial DialContextFunc) Option {
 }
 
 // WithTimeout sets the total deadline for one command or one backend's batch
-// exchange. Context deadlines take precedence when sooner. A zero duration
-// disables this client-side timeout.
+// exchange, from submission to response. Context deadlines take precedence
+// when sooner. A command whose deadline passes fails with
+// context.DeadlineExceeded. When the oldest command on a connection goes
+// unanswered past its deadline the connection is treated as unresponsive
+// and closed, and every command in flight on it fails with it. A zero
+// duration disables this client-side timeout, and then a hung server can
+// hold a connection until its context ends.
 func WithTimeout(timeout time.Duration) Option {
 	return optionFunc(func(c *config) error {
 		if timeout < 0 {
@@ -251,11 +256,11 @@ func WithDialTimeout(timeout time.Duration) Option {
 	})
 }
 
-// WithIdleTimeout bounds how long a pooled connection may sit idle before it
-// is discarded and replaced by a fresh dial. Connections silently dropped by
-// a restarted server or an intermediary while idle would otherwise surface as
-// a spurious error, or as an AmbiguousWriteError on a mutation. Zero disables
-// the limit. The default is 90 seconds.
+// WithIdleTimeout bounds how long a connection with nothing in flight may
+// sit idle before it is closed and replaced by a fresh dial. Connections
+// silently dropped by a restarted server or an intermediary while idle would
+// otherwise surface as a spurious error, or as an AmbiguousWriteError on a
+// mutation. Zero disables the limit. The default is 90 seconds.
 func WithIdleTimeout(timeout time.Duration) Option {
 	return optionFunc(func(c *config) error {
 		if timeout < 0 {
@@ -266,14 +271,19 @@ func WithIdleTimeout(timeout time.Duration) Option {
 	})
 }
 
-// WithMaxIdleConns sets the number of idle connections retained per server.
-// Active connections are not capped. Zero disables pooling.
-func WithMaxIdleConns(max int) Option {
+// WithMaxConns caps the connections opened to each server. Commands issued
+// concurrently share a connection and are pipelined on it in one write, so
+// one connection per server, the default, already gives N concurrent
+// commands one round trip. A further connection is dialed only while every
+// existing one has commands in flight, which spreads load across memcached
+// worker threads and keeps a large value transfer from delaying unrelated
+// commands. The cap must be at least one.
+func WithMaxConns(max int) Option {
 	return optionFunc(func(c *config) error {
-		if max < 0 {
-			return fmt.Errorf("memcache: max idle connections must not be negative")
+		if max < 1 {
+			return fmt.Errorf("memcache: max connections must be at least one")
 		}
-		c.maxIdle = max
+		c.maxConns = max
 		return nil
 	})
 }
