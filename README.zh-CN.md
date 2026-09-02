@@ -22,29 +22,40 @@ defer mc.Close()
 
 多服务器时，key 通过稳定的 rendezvous 哈希分布，`WithRouter` 可以替换路由策略。每个服务器有一个弹性连接池，`WithMaxIdleConns` 限制保留的空闲连接数（不是活跃请求数），空闲超过 `WithIdleTimeout`（默认 90 秒）的连接会被重新拨号。
 
-其他选项有 `WithTimeout`（单次请求）、`WithDialTimeout`、`WithNetwork`、`WithDialer`、`WithMaxItemSize`，以及下文介绍的策略选项 `Degrade`、`OnError` 和客户端级的 `RefreshAhead` 默认值。
+其他选项有 `WithTimeout`（单次请求）、`WithDialTimeout`、`WithNetwork`、`WithDialer`、`WithMaxItemSize`，以及下文介绍的策略选项 `WithCodec`、`Degrade`、`OnError` 和客户端级的 `RefreshAhead` 默认值。
 
 每个方法的第一个参数都是 `context.Context`。
 
 ## 值与 key
 
-值的类型是 `[]byte`，序列化由调用方负责。空值会被拒绝，因为 memcached 用零字节条目表示 lease 占位符。
+对象类动词（`Get`、`GetMany`、`Set`、`SetMany`、`Add`、`Replace`、`Fetch`、`Update`）是泛型方法。值类型 `T` 只要出现在实参或回调里就由编译器推导，只有 `Get` 和 `GetMany` 需要写出来，因为值只出现在返回值中。值用客户端的 `Codec` 编解码，默认是 `JSONCodec`，`WithCodec` 可以换成别的。
+
+```go
+type Codec interface {
+    Marshal(value any) ([]byte, error)
+    Unmarshal(data []byte, value any) error
+}
+```
+
+`[]byte` 是恒等类型：不论用什么 codec，它都原样存入、原样读出，所以 `Get[[]byte]` 总是拿到原始字节。计数器动词（`Incr`、`Decr`）和原始字节动词（`Append`、`Prepend`、`Take`）从不经过 codec。编码或解码失败是错误，不会伪装成未命中。
+
+空的编码结果会被拒绝，因为 memcached 用零字节条目表示 lease 占位符。
 
 任何字符串都可以作为 key。包含空白或控制字节的 key 会在协议层自动用 meta 的 `b` 标志做 base64 编码。
 
 ## 读取
 
 ```go
-func (c *Client) Get(ctx context.Context, key string, options ...GetOption) (value []byte, ok bool, err error)
-func (c *Client) GetMany(ctx context.Context, keys []string, options ...GetOption) (map[string][]byte, error)
+func (c *Client) Get[T any](ctx context.Context, key string, options ...GetOption) (value T, ok bool, err error)
+func (c *Client) GetMany[T any](ctx context.Context, keys []string, options ...GetOption) (map[string]T, error)
 func (c *Client) Inspect(ctx context.Context, key string) (info ItemInfo, ok bool, err error)
 ```
 
 `Get` 读取一个值。未命中是正常的回答，不是错误。读操作返回 `(value, ok, err)`，`ok` 表示是否存在，`err` 表示基础设施故障，两者永不混淆。
 
 ```go
-user, ok, err := mc.Get(ctx, "user:"+uid)
-if err != nil { /* infrastructure failure */ }
+user, ok, err := mc.Get[User](ctx, "user:"+uid)
+if err != nil { /* infrastructure failure or undecodable value */ }
 if !ok {
     user = loadUser(uid)
     mc.Set(ctx, "user:"+uid, user, 10*time.Minute)
@@ -56,7 +67,7 @@ if !ok {
 `Touch(ttl)` 选项让同一条协议命令在读取的同时把命中值的过期时间顺延到 `ttl`，这使 `Get` 成为会话续期的读取一半。可选修饰符按方法类型化，`Touch` 只被 `Get` 和 `GetMany` 接受，`RefreshAhead` 只被 `Fetch` 接受，把选项用在没有意义的方法上是编译错误，而不是运行时的意外。
 
 ```go
-session, ok, err := mc.Get(ctx, "session:"+sid, memcache.Touch(30*time.Minute))
+session, ok, err := mc.Get[Session](ctx, "session:"+sid, memcache.Touch(30*time.Minute))
 ```
 
 这个顺延就是 memcached 原生的 touch，是盲目的：读到什么就延长什么，包括被 `Invalidate` 标记为过时的值。必须立刻生效的撤销要走 `Delete`。
@@ -66,10 +77,10 @@ session, ok, err := mc.Get(ctx, "session:"+sid, memcache.Touch(30*time.Minute))
 ## 写入
 
 ```go
-func (c *Client) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
-func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, ttl time.Duration) error
-func (c *Client) Add(ctx context.Context, key string, value []byte, ttl time.Duration) (ok bool, err error)
-func (c *Client) Replace(ctx context.Context, key string, value []byte, ttl time.Duration) (ok bool, err error)
+func (c *Client) Set[T any](ctx context.Context, key string, value T, ttl time.Duration) error
+func (c *Client) SetMany[T any](ctx context.Context, mapping map[string]T, ttl time.Duration) error
+func (c *Client) Add[T any](ctx context.Context, key string, value T, ttl time.Duration) (ok bool, err error)
+func (c *Client) Replace[T any](ctx context.Context, key string, value T, ttl time.Duration) (ok bool, err error)
 func (c *Client) Touch(ctx context.Context, key string, ttl time.Duration) error
 func (c *Client) Delete(ctx context.Context, key string) error
 func (c *Client) DeleteMany(ctx context.Context, keys []string) error
@@ -81,7 +92,7 @@ func (c *Client) Invalidate(ctx context.Context, key string, grace time.Duration
 每个写入值的方法都把 TTL 作为位置参数 `ttl time.Duration` 接收，客户端没有全局默认 TTL。传 `0` 表示永不过期，也可以用常量 `memcache.Forever` 让这个选择在调用处一目了然。负的 TTL 是错误。
 
 ```go
-err = mc.Set(ctx, "config:site", buf, memcache.Forever)
+err = mc.Set(ctx, "config:site", siteConfig, memcache.Forever)
 ```
 
 `Add` 只在 key 不存在时存储，并报告本次调用是否成功，可以直接当作多实例部署下只执行一次的保护。
@@ -113,8 +124,8 @@ mc.Invalidate(ctx, "article:"+aid, time.Minute)   // 软失效，读者短暂拿
 ## 读取或计算
 
 ```go
-func (c *Client) Fetch(ctx context.Context, key string, ttl time.Duration,
-    loader func(context.Context) ([]byte, error), options ...FetchOption) ([]byte, error)
+func (c *Client) Fetch[T any](ctx context.Context, key string, ttl time.Duration,
+    loader func(context.Context) (T, error), options ...FetchOption) (T, error)
 ```
 
 `Fetch` 把最高频的缓存场景做成一个方法。它返回缓存中的值，或者运行 `loader` 计算它并以 `ttl` 存储结果。
@@ -133,27 +144,21 @@ feed, err := mc.Fetch(ctx, "home:"+uid, 5*time.Minute, buildFeed,
 )
 ```
 
-loader 运行在客户端持有的 context 上而不是调用请求的 context 上，因为它的结果可能被其他等待者共享，也可能比调用者活得更久。所有写回都以选举时观察到的版本为条件，因此重算过程中被删除的 key 永远不会被复活。写回失败不会改变 `Fetch` 的返回值，它们进入 `OnError` 钩子。`Fetch` 不会因为协调失败而失败，每条路径的终点都是一个值、loader 自己的错误，或调用者的 context 错误。
+loader 运行在客户端持有的 context 上而不是调用请求的 context 上，因为它的结果可能被其他等待者共享，也可能比调用者活得更久。每个调用者（包括赢得选举的那个）拿到的都是存储形态解码出的独立副本，所以 `Fetch` 返回的永远和之后 `Get` 读到的一致。所有写回都以选举时观察到的版本为条件，因此重算过程中被删除的 key 永远不会被复活。写回失败不会改变 `Fetch` 的返回值，它们进入 `OnError` 钩子。`Fetch` 不会因为协调失败而失败，每条路径的终点都是一个值、loader 自己的错误，或调用者的 context 错误。
 
 ## 原子修改
 
 ```go
-func (c *Client) Update(ctx context.Context, key string, ttl time.Duration,
-    fn func(current []byte, found bool) ([]byte, error)) ([]byte, error)
+func (c *Client) Update[T any](ctx context.Context, key string, ttl time.Duration,
+    fn func(current T, found bool) (T, error)) (T, error)
 ```
 
-`Update` 原子地变换一个值。它带版本读出当前值，应用 `fn`，只在中间没有别人改动时写回，冲突则重试。未命中时 `fn` 收到 `(nil, false)`。`fn` 返回错误会中止整个操作，条目保持未写入，错误原样传出。`fn` 可能运行多次，因此必须是纯函数。如果重试循环一直输给并发写入者，`Update` 返回 `ErrConflict`。被 `Invalidate` 标记为过时的值按未命中处理，因为变换已失效的数据等于悄悄把它洗回新鲜。
+`Update` 原子地变换一个值。它带版本读出当前值，应用 `fn`，只在中间没有别人改动时写回，冲突则重试。未命中时 `fn` 收到 `T` 的零值和 `false`。`fn` 返回错误会中止整个操作，条目保持未写入，错误原样传出。`fn` 可能运行多次，因此必须是纯函数。如果重试循环一直输给并发写入者，`Update` 返回 `ErrConflict`。被 `Invalidate` 标记为过时的值按未命中处理，因为变换已失效的数据等于悄悄把它洗回新鲜。
 
 ```go
 cart, err := mc.Update(ctx, "cart:"+uid, 30*time.Minute,
-    func(current []byte, found bool) ([]byte, error) {
-        var items []Item
-        if found {
-            if err := json.Unmarshal(current, &items); err != nil {
-                return nil, err
-            }
-        }
-        return json.Marshal(append(items, item))
+    func(items []Item, found bool) ([]Item, error) {
+        return append(items, item), nil
     },
 )
 ```

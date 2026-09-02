@@ -23,6 +23,7 @@ type config struct {
 	router               Router
 	copyServersForRouter bool
 
+	codec               Codec
 	defaultRefreshAhead *time.Duration
 	degrade             bool
 	onError             func(error)
@@ -40,6 +41,7 @@ func defaultConfig(server string) config {
 		maxIdle:     23,
 		maxItemSize: 1024 * 1024,
 		router:      RendezvousRouter{},
+		codec:       JSONCodec{},
 	}
 }
 
@@ -49,7 +51,8 @@ func defaultConfig(server string) config {
 type Option interface{ applyOption(*config) error }
 
 // PolicyOption is an Option that declares a client-wide policy default, such
-// as RefreshAhead, Degrade, or OnError. Engine options are not PolicyOptions.
+// as RefreshAhead, Degrade, OnError, or WithCodec. Engine options are not
+// PolicyOptions.
 type PolicyOption interface {
 	Option
 	policyOption()

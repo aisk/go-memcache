@@ -22,29 +22,40 @@ defer mc.Close()
 
 With multiple servers, keys are distributed by stable rendezvous hashing and `WithRouter` replaces the routing. Each server has an elastic connection pool. `WithMaxIdleConns` limits retained idle connections (not active requests) and idle connections are redialed after `WithIdleTimeout` (90 seconds by default).
 
-Other options are `WithTimeout` (per request), `WithDialTimeout`, `WithNetwork`, `WithDialer`, `WithMaxItemSize`, plus the policy options `Degrade`, `OnError` and a client wide `RefreshAhead` default described below.
+Other options are `WithTimeout` (per request), `WithDialTimeout`, `WithNetwork`, `WithDialer`, `WithMaxItemSize`, plus the policy options `WithCodec`, `Degrade`, `OnError` and a client wide `RefreshAhead` default described below.
 
 Every method takes a `context.Context` as its first parameter.
 
 ## Values and keys
 
-Values are `[]byte` and serialization stays with the caller. Empty values are rejected, because memcached represents lease placeholders as zero byte items.
+The object verbs (`Get`, `GetMany`, `Set`, `SetMany`, `Add`, `Replace`, `Fetch`, `Update`) are generic methods. Their value type `T` is inferred from the argument or callback wherever one exists, and is spelled out only on `Get` and `GetMany`, where the value appears in the return position alone. Values are encoded with the client's `Codec`, `JSONCodec` by default, and `WithCodec` installs another.
+
+```go
+type Codec interface {
+    Marshal(value any) ([]byte, error)
+    Unmarshal(data []byte, value any) error
+}
+```
+
+`[]byte` is the identity type: it is stored and read back untouched, whatever the codec, so `Get[[]byte]` always returns the raw stored bytes. The counter verbs (`Incr`, `Decr`) and the raw bytes verbs (`Append`, `Prepend`, `Take`) never consult the codec. A value that fails to encode or decode is an error, never a miss.
+
+Empty encodings are rejected, because memcached represents lease placeholders as zero byte items.
 
 Any string is a usable key. Keys containing whitespace or control bytes are automatically base64 encoded on the wire with the meta `b` flag.
 
 ## Reading
 
 ```go
-func (c *Client) Get(ctx context.Context, key string, options ...GetOption) (value []byte, ok bool, err error)
-func (c *Client) GetMany(ctx context.Context, keys []string, options ...GetOption) (map[string][]byte, error)
+func (c *Client) Get[T any](ctx context.Context, key string, options ...GetOption) (value T, ok bool, err error)
+func (c *Client) GetMany[T any](ctx context.Context, keys []string, options ...GetOption) (map[string]T, error)
 func (c *Client) Inspect(ctx context.Context, key string) (info ItemInfo, ok bool, err error)
 ```
 
 `Get` reads one value. A miss is a normal answer, not an error. Reads return `(value, ok, err)` where `ok` reports presence and `err` reports infrastructure failure. The two never mix.
 
 ```go
-user, ok, err := mc.Get(ctx, "user:"+uid)
-if err != nil { /* infrastructure failure */ }
+user, ok, err := mc.Get[User](ctx, "user:"+uid)
+if err != nil { /* infrastructure failure or undecodable value */ }
 if !ok {
     user = loadUser(uid)
     mc.Set(ctx, "user:"+uid, user, 10*time.Minute)
@@ -56,7 +67,7 @@ if !ok {
 The `Touch(ttl)` option makes the same protocol command also slide each hit's expiration to `ttl`, which turns `Get` into the read half of session renewal. Options are typed per verb. `Touch` is accepted only by `Get` and `GetMany`, `RefreshAhead` only by `Fetch`, so putting an option on a verb it has no meaning for is a compile error rather than a runtime surprise.
 
 ```go
-session, ok, err := mc.Get(ctx, "session:"+sid, memcache.Touch(30*time.Minute))
+session, ok, err := mc.Get[Session](ctx, "session:"+sid, memcache.Touch(30*time.Minute))
 ```
 
 The slide is memcached's native touch and is blind. It extends whatever the read hits, including a value kept stale by `Invalidate`. A revocation that must stick goes through `Delete`.
@@ -66,10 +77,10 @@ The slide is memcached's native touch and is blind. It extends whatever the read
 ## Writing
 
 ```go
-func (c *Client) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
-func (c *Client) SetMany(ctx context.Context, mapping map[string][]byte, ttl time.Duration) error
-func (c *Client) Add(ctx context.Context, key string, value []byte, ttl time.Duration) (ok bool, err error)
-func (c *Client) Replace(ctx context.Context, key string, value []byte, ttl time.Duration) (ok bool, err error)
+func (c *Client) Set[T any](ctx context.Context, key string, value T, ttl time.Duration) error
+func (c *Client) SetMany[T any](ctx context.Context, mapping map[string]T, ttl time.Duration) error
+func (c *Client) Add[T any](ctx context.Context, key string, value T, ttl time.Duration) (ok bool, err error)
+func (c *Client) Replace[T any](ctx context.Context, key string, value T, ttl time.Duration) (ok bool, err error)
 func (c *Client) Touch(ctx context.Context, key string, ttl time.Duration) error
 func (c *Client) Delete(ctx context.Context, key string) error
 func (c *Client) DeleteMany(ctx context.Context, keys []string) error
@@ -81,7 +92,7 @@ func (c *Client) Invalidate(ctx context.Context, key string, grace time.Duration
 Every storing method takes its TTL as a positional `ttl time.Duration` parameter, with no client wide default. Passing `0` stores without expiration, and the constant `memcache.Forever` spells that choice out at the call site. A negative TTL is an error.
 
 ```go
-err = mc.Set(ctx, "config:site", buf, memcache.Forever)
+err = mc.Set(ctx, "config:site", siteConfig, memcache.Forever)
 ```
 
 `Add` stores only when the key is absent and reports whether this caller won, which makes it a simple once only guard for multi instance deployments.
@@ -113,8 +124,8 @@ During the grace period plain readers keep getting the old copy while `Fetch` el
 ## Get or compute
 
 ```go
-func (c *Client) Fetch(ctx context.Context, key string, ttl time.Duration,
-    loader func(context.Context) ([]byte, error), options ...FetchOption) ([]byte, error)
+func (c *Client) Fetch[T any](ctx context.Context, key string, ttl time.Duration,
+    loader func(context.Context) (T, error), options ...FetchOption) (T, error)
 ```
 
 `Fetch` is the highest frequency cache pattern as one verb. It returns the cached value, or runs `loader` to compute it and stores the result for `ttl`.
@@ -133,27 +144,21 @@ feed, err := mc.Fetch(ctx, "home:"+uid, 5*time.Minute, buildFeed,
 )
 ```
 
-The loader runs on a context owned by the client, not the calling request's context, because its result may be shared by other waiters or outlive the caller entirely. Every write back is conditional on the version observed at election, so a key deleted mid recompute is never resurrected. Write back failures never change what `Fetch` returns, they go to the `OnError` hook. `Fetch` never fails because coordination failed. Every path ends in a value, the loader's own error, or the caller's context error.
+The loader runs on a context owned by the client, not the calling request's context, because its result may be shared by other waiters or outlive the caller entirely. Every caller, the winner included, receives its own decoded copy of the stored form, so what `Fetch` returns is always what a later `Get` would return. Every write back is conditional on the version observed at election, so a key deleted mid recompute is never resurrected. Write back failures never change what `Fetch` returns, they go to the `OnError` hook. `Fetch` never fails because coordination failed. Every path ends in a value, the loader's own error, or the caller's context error.
 
 ## Atomic modification
 
 ```go
-func (c *Client) Update(ctx context.Context, key string, ttl time.Duration,
-    fn func(current []byte, found bool) ([]byte, error)) ([]byte, error)
+func (c *Client) Update[T any](ctx context.Context, key string, ttl time.Duration,
+    fn func(current T, found bool) (T, error)) (T, error)
 ```
 
-`Update` atomically transforms a value. It reads the current value with its version, applies `fn`, writes back only if nothing changed in between, and retries on conflict. On a miss `fn` receives `(nil, false)`. Returning an error from `fn` aborts the whole operation, the entry is left unwritten and the error propagates unchanged. `fn` may run multiple times, so it must be pure. If the retry loop keeps losing to concurrent writers, `Update` returns `ErrConflict`. A value kept stale by `Invalidate` counts as a miss, because transforming invalidated data would silently launder it back to fresh.
+`Update` atomically transforms a value. It reads the current value with its version, applies `fn`, writes back only if nothing changed in between, and retries on conflict. On a miss `fn` receives the zero value of `T` and `false`. Returning an error from `fn` aborts the whole operation, the entry is left unwritten and the error propagates unchanged. `fn` may run multiple times, so it must be pure. If the retry loop keeps losing to concurrent writers, `Update` returns `ErrConflict`. A value kept stale by `Invalidate` counts as a miss, because transforming invalidated data would silently launder it back to fresh.
 
 ```go
 cart, err := mc.Update(ctx, "cart:"+uid, 30*time.Minute,
-    func(current []byte, found bool) ([]byte, error) {
-        var items []Item
-        if found {
-            if err := json.Unmarshal(current, &items); err != nil {
-                return nil, err
-            }
-        }
-        return json.Marshal(append(items, item))
+    func(items []Item, found bool) ([]Item, error) {
+        return append(items, item), nil
     },
 )
 ```

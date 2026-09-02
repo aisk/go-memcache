@@ -16,10 +16,39 @@ const updateAttempts = 8
 // writing. fn may run multiple times and must be pure. A value kept stale by
 // Invalidate is treated as a miss: fn transforms rather than recomputes, and
 // transforming invalidated data would silently launder it back to fresh.
-func (c *Client) Update(ctx context.Context, key string, ttl time.Duration, fn func(current []byte, found bool) ([]byte, error)) ([]byte, error) {
+// Values cross the client's codec in both directions; a []byte value passes
+// through untouched. The result is the value fn returned on the attempt that
+// was stored.
+func (c *Client) Update[T any](ctx context.Context, key string, ttl time.Duration, fn func(current T, found bool) (T, error)) (T, error) {
+	var zero T
 	if fn == nil {
-		return nil, fmt.Errorf("memcache: Update requires a transform function")
+		return zero, fmt.Errorf("memcache: Update requires a transform function")
 	}
+	var stored T
+	_, err := c.update(ctx, key, ttl, func(current []byte, found bool) ([]byte, error) {
+		var value T
+		if found {
+			var err error
+			if value, err = decode[T](c, current); err != nil {
+				return nil, err
+			}
+		}
+		next, err := fn(value, found)
+		if err != nil {
+			return nil, err
+		}
+		stored = next
+		return c.encode(next)
+	})
+	if err != nil {
+		return zero, err
+	}
+	return stored, nil
+}
+
+// update is Update's read, transform, compare-and-swap loop over stored
+// bytes.
+func (c *Client) update(ctx context.Context, key string, ttl time.Duration, fn func(current []byte, found bool) ([]byte, error)) ([]byte, error) {
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
 		return nil, err

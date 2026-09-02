@@ -6,8 +6,9 @@
 // is a normal answer, never an error; concurrency coordination (leases,
 // compare-and-swap loops, request merging) is the library's job and never
 // appears in caller code; failure behavior is an explicit policy (Degrade,
-// OnError). Values are []byte in this release; the typed layer arrives with
-// generic methods in go1.27.
+// OnError). The object verbs are generic methods: values are encoded with
+// the client's Codec (JSON by default), and []byte always passes through
+// untouched.
 //
 // The 1:1 protocol layer remains fully available behind Client.Meta.
 // Client is safe for concurrent use.

@@ -42,9 +42,9 @@ func TestPolicyResolutionErrors(t *testing.T) {
 		"Replace":   func() error { _, err := client.Replace(ctx, "k", []byte("v"), -time.Second); return err },
 		"Fetch":     func() error { _, err := client.Fetch(ctx, "k", -time.Second, loader); return err },
 		"Update":    func() error { _, err := client.Update(ctx, "k", -time.Second, transform); return err },
-		"Get+Touch": func() error { _, _, err := client.Get(ctx, "k", Touch(-time.Second)); return err },
+		"Get+Touch": func() error { _, _, err := client.Get[[]byte](ctx, "k", Touch(-time.Second)); return err },
 		"GetMany+Touch": func() error {
-			_, err := client.GetMany(ctx, []string{"k"}, Touch(-time.Second))
+			_, err := client.GetMany[[]byte](ctx, []string{"k"}, Touch(-time.Second))
 			return err
 		},
 		"Touch": func() error { return client.Touch(ctx, "k", -time.Second) },
@@ -85,10 +85,10 @@ func TestEmptyValuesAreRejectedByWrites(t *testing.T) {
 	}
 	ctx := context.Background()
 	writes := map[string]func() error{
-		"Set":     func() error { return client.Set(ctx, "k", nil, time.Minute) },
+		"Set":     func() error { return client.Set(ctx, "k", []byte(nil), time.Minute) },
 		"SetMany": func() error { return client.SetMany(ctx, map[string][]byte{"k": {}}, time.Minute) },
-		"Add":     func() error { _, err := client.Add(ctx, "k", nil, time.Minute); return err },
-		"Replace": func() error { _, err := client.Replace(ctx, "k", nil, time.Minute); return err },
+		"Add":     func() error { _, err := client.Add(ctx, "k", []byte(nil), time.Minute); return err },
+		"Replace": func() error { _, err := client.Replace(ctx, "k", []byte(nil), time.Minute); return err },
 		"Append":  func() error { return client.Append(ctx, "k", nil, time.Minute) },
 		"Prepend": func() error { return client.Prepend(ctx, "k", nil, time.Minute) },
 	}
@@ -135,13 +135,13 @@ func TestDegradeSurfacesUsageErrorsAndCancellation(t *testing.T) {
 		t.Fatalf("oversized set was absorbed: %v", err)
 	}
 	longKey := strings.Repeat("k", 300)
-	if _, _, err := client.Get(ctx, longKey); err == nil || !strings.Contains(err.Error(), "maximum") {
+	if _, _, err := client.Get[[]byte](ctx, longKey); err == nil || !strings.Contains(err.Error(), "maximum") {
 		t.Fatalf("over-long key was absorbed: %v", err)
 	}
 
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	if _, _, err := client.Get(canceled, "k"); !errors.Is(err, context.Canceled) {
+	if _, _, err := client.Get[[]byte](canceled, "k"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled read was absorbed: %v", err)
 	}
 	if err := client.Set(canceled, "k", []byte("v"), time.Minute); !errors.Is(err, context.Canceled) {
@@ -178,13 +178,13 @@ func TestDegradePolicyAgainstDeadBackend(t *testing.T) {
 	ctx := context.Background()
 
 	// Reads degrade into a miss.
-	if _, ok, err := client.Get(ctx, "k"); err != nil || ok {
+	if _, ok, err := client.Get[[]byte](ctx, "k"); err != nil || ok {
 		t.Fatalf("degraded get: ok=%v err=%v", ok, err)
 	}
-	if found, err := client.GetMany(ctx, []string{"a", "b"}); err != nil || len(found) != 0 {
+	if found, err := client.GetMany[[]byte](ctx, []string{"a", "b"}); err != nil || len(found) != 0 {
 		t.Fatalf("degraded get many: %#v, %v", found, err)
 	}
-	if _, ok, err := client.Get(ctx, "k", Touch(time.Minute)); err != nil || ok {
+	if _, ok, err := client.Get[[]byte](ctx, "k", Touch(time.Minute)); err != nil || ok {
 		t.Fatalf("degraded get with touch: ok=%v err=%v", ok, err)
 	}
 	if _, ok, err := client.Inspect(ctx, "k"); err != nil || ok {

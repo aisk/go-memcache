@@ -61,10 +61,10 @@ func TestIntegrationObjectCache(t *testing.T) {
 	ctx := context.Background()
 	value := []byte("a\r\n\x00b")
 
-	if _, ok, err := c.Get(ctx, "binary key"); err != nil || ok {
+	if _, ok, err := c.Get[[]byte](ctx, "binary key"); err != nil || ok {
 		t.Fatalf("miss: ok=%v err=%v", ok, err)
 	}
-	if err := c.Set(ctx, "binary key", nil, time.Minute); err == nil {
+	if err := c.Set(ctx, "binary key", []byte(nil), time.Minute); err == nil {
 		t.Fatal("empty value was accepted")
 	}
 	if err := c.Set(ctx, "binary key", value, time.Minute); err != nil {
@@ -78,7 +78,7 @@ func TestIntegrationObjectCache(t *testing.T) {
 	if info, ok, err := c.Inspect(ctx, "eternal"); err != nil || !ok || info.TTL >= 0 {
 		t.Fatalf("forever entry: %#v ok=%v err=%v", info, ok, err)
 	}
-	got, ok, err := c.Get(ctx, "binary key")
+	got, ok, err := c.Get[[]byte](ctx, "binary key")
 	if err != nil || !ok || string(got) != string(value) {
 		t.Fatalf("hit: %q ok=%v err=%v", got, ok, err)
 	}
@@ -110,7 +110,7 @@ func TestIntegrationObjectCache(t *testing.T) {
 	if err := c.Delete(ctx, "binary key"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := c.Get(ctx, "binary key"); ok {
+	if _, ok, _ := c.Get[[]byte](ctx, "binary key"); ok {
 		t.Fatal("deleted key still readable")
 	}
 	if err := c.Delete(ctx, "binary key"); err != nil {
@@ -123,13 +123,13 @@ func TestIntegrationSessionRenewal(t *testing.T) {
 	ctx := context.Background()
 	const sessionTTL = time.Minute
 
-	if _, ok, err := c.Get(ctx, "session:1", Touch(sessionTTL)); err != nil || ok {
+	if _, ok, err := c.Get[[]byte](ctx, "session:1", Touch(sessionTTL)); err != nil || ok {
 		t.Fatalf("expired session: ok=%v err=%v", ok, err)
 	}
 	if err := c.Set(ctx, "session:1", []byte("s"), 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	got, ok, err := c.Get(ctx, "session:1", Touch(sessionTTL))
+	got, ok, err := c.Get[[]byte](ctx, "session:1", Touch(sessionTTL))
 	if err != nil || !ok || string(got) != "s" {
 		t.Fatalf("get with touch: %q ok=%v err=%v", got, ok, err)
 	}
@@ -157,7 +157,7 @@ func TestIntegrationCollections(t *testing.T) {
 	if err := c.SetMany(ctx, mapping, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	found, err := c.GetMany(ctx, []string{"a", "b", "c", "missing"})
+	found, err := c.GetMany[[]byte](ctx, []string{"a", "b", "c", "missing"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestIntegrationCollections(t *testing.T) {
 	if err := c.DeleteMany(ctx, []string{"a", "b", "not-there"}); err != nil {
 		t.Fatal(err)
 	}
-	found, err = c.GetMany(ctx, []string{"a", "b", "c"})
+	found, err = c.GetMany[[]byte](ctx, []string{"a", "b", "c"})
 	if err != nil || len(found) != 1 || string(found["c"]) != "C" {
 		t.Fatalf("after delete many: %#v, %v", found, err)
 	}
@@ -224,7 +224,7 @@ func TestIntegrationFetchLoaderError(t *testing.T) {
 		t.Fatalf("loader error was not passed through: %v", err)
 	}
 	// The failed winner must not have cached anything readable.
-	if _, ok, err := c.Get(context.Background(), "broken"); err != nil || ok {
+	if _, ok, err := c.Get[[]byte](context.Background(), "broken"); err != nil || ok {
 		t.Fatalf("after failed load: ok=%v err=%v", ok, err)
 	}
 }
@@ -248,7 +248,7 @@ func TestIntegrationFetchRefreshAhead(t *testing.T) {
 		t.Fatalf("refresh-ahead fetch: %q, %v", got, err)
 	}
 	waitFor(t, func() bool {
-		value, ok, err := c.Get(ctx, "feed")
+		value, ok, err := c.Get[[]byte](ctx, "feed")
 		return err == nil && ok && string(value) == "new"
 	}, "background refresh never landed")
 	if calls.Load() != 1 {
@@ -268,7 +268,7 @@ func TestIntegrationInvalidateGrace(t *testing.T) {
 	// Soft invalidation means plain readers keep the old copy, unmarked. The
 	// server offers this first reader the recache token; a loaderless Get
 	// hands it back in the background so Fetch can still elect.
-	got, ok, err := c.Get(ctx, "article")
+	got, ok, err := c.Get[[]byte](ctx, "article")
 	if err != nil || !ok || string(got) != "v1" {
 		t.Fatalf("stale read: %q ok=%v err=%v", got, ok, err)
 	}
@@ -337,7 +337,7 @@ func TestIntegrationUpdate(t *testing.T) {
 			t.Fatalf("writer %d: %v", i, err)
 		}
 	}
-	final, ok, err := c.Get(ctx, "cart")
+	final, ok, err := c.Get[[]byte](ctx, "cart")
 	if err != nil || !ok || string(final) != strconv.Itoa(writers+1) {
 		t.Fatalf("final = %q ok=%v err=%v", final, ok, err)
 	}
@@ -349,7 +349,7 @@ func TestIntegrationUpdate(t *testing.T) {
 	}); !errors.Is(err, abort) {
 		t.Fatalf("fn error was not passed through: %v", err)
 	}
-	if _, ok, _ := c.Get(ctx, "never"); ok {
+	if _, ok, _ := c.Get[[]byte](ctx, "never"); ok {
 		t.Fatal("aborted update wrote a value")
 	}
 
@@ -367,7 +367,7 @@ func TestIntegrationUpdate(t *testing.T) {
 	if err != nil || string(got) != "fresh" {
 		t.Fatalf("stale update: %q, %v", got, err)
 	}
-	if value, ok, _ := c.Get(ctx, "cart"); !ok || string(value) != "fresh" {
+	if value, ok, _ := c.Get[[]byte](ctx, "cart"); !ok || string(value) != "fresh" {
 		t.Fatalf("after stale update: %q ok=%v", value, ok)
 	}
 }
@@ -414,7 +414,7 @@ func TestIntegrationAppendTake(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, ok, err := c.Get(ctx, "events")
+	got, ok, err := c.Get[[]byte](ctx, "events")
 	if err != nil || !ok || string(got) != "boot;login;click;" {
 		t.Fatalf("get: %q ok=%v err=%v", got, ok, err)
 	}
@@ -425,7 +425,7 @@ func TestIntegrationAppendTake(t *testing.T) {
 	if taken, err = c.Take(ctx, "events"); err != nil || taken != nil {
 		t.Fatalf("take empty: %q, %v", taken, err)
 	}
-	if _, ok, _ := c.Get(ctx, "events"); ok {
+	if _, ok, _ := c.Get[[]byte](ctx, "events"); ok {
 		t.Fatal("take left data behind")
 	}
 }
@@ -505,7 +505,7 @@ func TestIntegrationContextCancellation(t *testing.T) {
 	c := integrationClient(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err := c.Get(ctx, "key")
+	_, _, err := c.Get[[]byte](ctx, "key")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
 	}
@@ -534,7 +534,7 @@ func TestIntegrationMultiServerPartialFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("unreachable shard did not report an error")
 	}
-	got, ok, err := client.Get(context.Background(), "apple")
+	got, ok, err := client.Get[[]byte](context.Background(), "apple")
 	if err != nil || !ok || string(got) != "ok" {
 		t.Fatalf("routed read: %q ok=%v err=%v", got, ok, err)
 	}
@@ -545,7 +545,7 @@ func TestIntegrationMultiServerPartialFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = degraded.Close() })
-	found, err := degraded.GetMany(context.Background(), []string{"apple", "banana"})
+	found, err := degraded.GetMany[[]byte](context.Background(), []string{"apple", "banana"})
 	if err != nil || len(found) != 1 || string(found["apple"]) != "ok" {
 		t.Fatalf("degraded get many: %#v, %v", found, err)
 	}
@@ -560,7 +560,7 @@ func TestIntegrationZeroByteValueReadsAsMiss(t *testing.T) {
 	if _, err := c.Meta().Set(ctx, "empty", []byte{}, MetaSetOptions{TTL: 60}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := c.Get(ctx, "empty"); err != nil || ok {
+	if _, ok, err := c.Get[[]byte](ctx, "empty"); err != nil || ok {
 		t.Fatalf("zero-byte get: ok=%v err=%v", ok, err)
 	}
 	if v, err := c.Take(ctx, "empty"); err != nil || v != nil {
@@ -602,7 +602,7 @@ func TestIntegrationFetchBusyLeaseFallsBack(t *testing.T) {
 		t.Fatalf("local fallback ran the loader %d times", calls.Load())
 	}
 	// The loser must not have written back: the key still reads as a miss.
-	if _, ok, err := c.Get(ctx, "busy"); err != nil || ok {
+	if _, ok, err := c.Get[[]byte](ctx, "busy"); err != nil || ok {
 		t.Fatalf("loser wrote back: ok=%v err=%v", ok, err)
 	}
 }
@@ -623,7 +623,7 @@ func TestIntegrationFetchWriteBackDoesNotResurrect(t *testing.T) {
 	if err != nil || string(value) != "session" {
 		t.Fatalf("fetch: %q, %v", value, err)
 	}
-	if _, ok, err := c.Get(ctx, "logout"); err != nil || ok {
+	if _, ok, err := c.Get[[]byte](ctx, "logout"); err != nil || ok {
 		t.Fatalf("dead data was resurrected: ok=%v err=%v", ok, err)
 	}
 	if reports.Load() == 0 {
@@ -716,7 +716,7 @@ func TestIntegrationFetchLoaderErrorReleasesLease(t *testing.T) {
 	if err != nil || string(value) != "recovered" {
 		t.Fatalf("recovery fetch: %q, %v", value, err)
 	}
-	if got, ok, err := c.Get(ctx, "flaky"); err != nil || !ok || string(got) != "recovered" {
+	if got, ok, err := c.Get[[]byte](ctx, "flaky"); err != nil || !ok || string(got) != "recovered" {
 		t.Fatalf("recovery was not written back: %q ok=%v err=%v", got, ok, err)
 	}
 }
@@ -734,7 +734,7 @@ func TestIntegrationTouchIsBlindTowardInvalidated(t *testing.T) {
 	if err := c.Invalidate(ctx, "session:9", 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	got, ok, err := c.Get(ctx, "session:9", Touch(time.Hour))
+	got, ok, err := c.Get[[]byte](ctx, "session:9", Touch(time.Hour))
 	if err != nil || !ok || string(got) != "s" {
 		t.Fatalf("stale read with touch: %q ok=%v err=%v", got, ok, err)
 	}
@@ -761,7 +761,7 @@ func TestIntegrationFetchRepairsStoredEmptyValue(t *testing.T) {
 	if err != nil || string(value) != "real" {
 		t.Fatalf("fetch over empty value: %q, %v", value, err)
 	}
-	if got, ok, err := c.Get(ctx, "hollow"); err != nil || !ok || string(got) != "real" {
+	if got, ok, err := c.Get[[]byte](ctx, "hollow"); err != nil || !ok || string(got) != "real" {
 		t.Fatalf("empty value was not repaired: %q ok=%v err=%v", got, ok, err)
 	}
 }
