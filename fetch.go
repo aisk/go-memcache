@@ -72,35 +72,52 @@ func (c *Client) Fetch[T any](ctx context.Context, key string, ttl time.Duration
 	return decode[T](c, raw)
 }
 
-// fetch is Fetch's state machine over stored bytes.
-func (c *Client) fetch(ctx context.Context, key string, ttl time.Duration, loader func(context.Context) ([]byte, error), options ...FetchOption) ([]byte, error) {
+// fetchPlan is what a Fetch or FetchMany call resolves from its ttl and
+// options before touching the network.
+type fetchPlan struct {
+	expiration Expiration
+	window     time.Duration // bounds a background refresh
+	read       MetaGetOptions
+}
+
+func (c *Client) planFetch(ttl time.Duration, options []FetchOption) (fetchPlan, error) {
 	policy := c.config.callPolicy()
 	for _, option := range options {
 		if option == nil {
-			return nil, errNilOption
+			return fetchPlan{}, errNilOption
 		}
 		option.applyFetch(&policy)
 	}
 	expiration, err := resolveTTL(ttl)
 	if err != nil {
-		return nil, err
+		return fetchPlan{}, err
 	}
-	refreshWindow := fetchLeaseTTL
+	plan := fetchPlan{expiration: expiration, window: fetchLeaseTTL}
 	var refreshBefore *Expiration
 	if policy.refreshAhead != nil {
 		if *policy.refreshAhead <= 0 {
-			return nil, fmt.Errorf("memcache: RefreshAhead must be positive")
+			return fetchPlan{}, fmt.Errorf("memcache: RefreshAhead must be positive")
 		}
 		// A window at or beyond the TTL would put every write-back already
 		// inside it, turning steady reads into a perpetual recompute loop.
 		if ttl > 0 && *policy.refreshAhead >= ttl {
-			return nil, fmt.Errorf("memcache: RefreshAhead (%v) must be shorter than the TTL (%v)", *policy.refreshAhead, ttl)
+			return fetchPlan{}, fmt.Errorf("memcache: RefreshAhead (%v) must be shorter than the TTL (%v)", *policy.refreshAhead, ttl)
 		}
-		refreshWindow = *policy.refreshAhead
-		refreshBefore = ptr(ExpiresIn(refreshWindow))
+		plan.window = *policy.refreshAhead
+		refreshBefore = ptr(ExpiresIn(plan.window))
 	}
 	lease := ExpiresIn(fetchLeaseTTL)
-	readOptions := MetaGetOptions{ReturnCAS: true, VivifyTTL: &lease, RefreshBefore: refreshBefore}
+	plan.read = MetaGetOptions{ReturnCAS: true, VivifyTTL: &lease, RefreshBefore: refreshBefore}
+	return plan, nil
+}
+
+// fetch is Fetch's state machine over stored bytes.
+func (c *Client) fetch(ctx context.Context, key string, ttl time.Duration, loader func(context.Context) ([]byte, error), options ...FetchOption) ([]byte, error) {
+	plan, err := c.planFetch(ttl, options)
+	if err != nil {
+		return nil, err
+	}
+	expiration, refreshWindow, readOptions := plan.expiration, plan.window, plan.read
 	command, err := buildGet(key, readOptions)
 	if err != nil {
 		return nil, err
@@ -339,4 +356,329 @@ func (c *Client) writeBack(key string, value []byte, cas uint64, ttl Expiration)
 	if err != nil {
 		c.reportError(fmt.Errorf("memcache: fetch write-back of %q: %w", key, err))
 	}
+}
+
+// FetchMany is Fetch over a set of keys. It reads every key in one round
+// trip per backend, returns the cached values, and computes the rest with a
+// single loader call, storing what the loader returns for ttl. Each key is
+// coordinated exactly as Fetch coordinates one: a miss is leased to one
+// caller across processes, same-process callers share that caller's result,
+// and a key inside RefreshAhead or an Invalidate grace period returns its
+// current value while a background loader call recomputes it.
+//
+// The loader receives the keys that need computing and returns what it
+// found; a key it leaves out is absent from the result too, as it would be
+// after a miss at the source, and its lease is released so the next call
+// re-elects. Keys outside missing are ignored. A loader error fails the
+// whole call, as Fetch's does. The loader runs on a client-owned context
+// for the same reasons as Fetch's, and every value comes back decoded from
+// its stored form.
+func (c *Client) FetchMany[T any](ctx context.Context, keys []string, ttl time.Duration, loader func(ctx context.Context, missing []string) (map[string]T, error), options ...FetchOption) (map[string]T, error) {
+	if loader == nil {
+		return nil, fmt.Errorf("memcache: FetchMany requires a loader")
+	}
+	raw, err := c.fetchMany(ctx, keys, ttl, func(loaderCtx context.Context, missing []string) (map[string][]byte, error) {
+		values, err := loader(loaderCtx, missing)
+		if err != nil {
+			return nil, err
+		}
+		encoded := make(map[string][]byte, len(values))
+		for key, value := range values {
+			data, err := c.encode(value)
+			if err != nil {
+				return nil, err
+			}
+			encoded[key] = data
+		}
+		return encoded, nil
+	}, options...)
+	if err != nil {
+		return nil, err
+	}
+	found := make(map[string]T, len(raw))
+	var firstErr error
+	for key, data := range raw {
+		value, err := decode[T](c, data)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		found[key] = value
+	}
+	return found, firstErr
+}
+
+// leaseHolder is a key together with the CAS token of the read that won its
+// lease; a write-back or release is conditioned on that token.
+type leaseHolder struct {
+	key string
+	cas uint64
+}
+
+// fetchMany is FetchMany's state machine over stored bytes. It classifies
+// every key the way fetch classifies one, then makes one loader call for
+// all the keys this caller has to compute: leased keys are written back,
+// unleased ones (Degrade, a lossy miss, an exhausted wait) are not.
+func (c *Client) fetchMany(ctx context.Context, keys []string, ttl time.Duration, loader func(context.Context, []string) (map[string][]byte, error), options ...FetchOption) (map[string][]byte, error) {
+	plan, err := c.planFetch(ttl, options)
+	if err != nil {
+		return nil, err
+	}
+	found := make(map[string][]byte, len(keys))
+	pending := uniqueKeys(keys)
+	if len(pending) == 0 {
+		return found, nil
+	}
+
+	var lead, refresh []leaseHolder
+	var local []string
+	for attempt := 0; ; attempt++ {
+		operations := make([]Operation, len(pending))
+		for i, key := range pending {
+			operations[i] = GetOperation{Key: key, Options: plan.read}
+		}
+		results, err := c.batch(ctx, operations)
+		if err != nil {
+			return nil, err
+		}
+		var busy []string
+		for i, result := range results {
+			key := pending[i]
+			if result.Err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(result.Err, ctxErr) {
+					return nil, result.Err
+				}
+				if c.config.degrade {
+					c.reportError(result.Err)
+					local = append(local, key)
+					continue
+				}
+				return nil, result.Err
+			}
+			r := result.Get
+			switch {
+			case r.Status == GetHit && len(r.Value) > 0:
+				found[key] = r.Value
+				if r.Lease == LeaseGranted && r.Metadata.CAS != nil {
+					refresh = append(refresh, leaseHolder{key, *r.Metadata.CAS})
+				}
+			case r.Status == GetMiss && r.Lease == LeaseGranted && r.Metadata.CAS != nil:
+				lead = append(lead, leaseHolder{key, *r.Metadata.CAS})
+			case r.Status == GetHit && r.Lease != LeaseBusy:
+				if r.Metadata.CAS != nil {
+					lead = append(lead, leaseHolder{key, *r.Metadata.CAS})
+				} else {
+					local = append(local, key)
+				}
+			case r.Status == GetMiss:
+				local = append(local, key)
+			default:
+				busy = append(busy, key)
+			}
+		}
+		if len(busy) == 0 {
+			break
+		}
+		// Another caller holds these leases. Same-process waiters share the
+		// winner's pending result; the rest are re-read after a short wait
+		// until the schedule runs out, then computed locally.
+		var remaining []string
+		for _, key := range busy {
+			value, err, joined := c.joinFlight(ctx, key)
+			switch {
+			case !joined:
+				remaining = append(remaining, key)
+			case err != nil:
+				return nil, err
+			case len(value) > 0:
+				found[key] = value
+			}
+		}
+		if len(remaining) == 0 {
+			break
+		}
+		if attempt >= len(fetchWaitBackoff) {
+			local = append(local, remaining...)
+			break
+		}
+		select {
+		case <-time.After(fetchWaitBackoff[attempt]):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		pending = remaining
+	}
+
+	if len(refresh) > 0 {
+		c.spawnRefreshMany(refresh, plan.expiration, plan.window, loader)
+	}
+	if len(lead) == 0 && len(local) == 0 {
+		return found, nil
+	}
+	computed, err := c.runFlights(ctx, lead, local, loader)
+	// Settle every lease this caller won, whether its loader ran here or the
+	// key was joined from another caller's flight: a value is written back
+	// under the winning CAS, anything else releases the placeholder so the
+	// next call re-elects instead of waiting out the lease.
+	for _, holder := range lead {
+		value, present := computed[holder.key]
+		switch {
+		case err == nil && len(value) > 0:
+			c.writeBack(holder.key, value, holder.cas, plan.expiration)
+		default:
+			if err == nil && present && value != nil {
+				c.reportError(fmt.Errorf("memcache: fetch loader for %q returned an empty value, which cannot be cached", holder.key))
+			}
+			c.releaseLease(holder.key, holder.cas)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range computed {
+		if len(value) > 0 {
+			found[key] = value
+		}
+	}
+	return found, nil
+}
+
+// runFlights is runFlight over a set of keys with one loader call. Keys
+// already in flight in this process are joined rather than recomputed, so a
+// concurrent Fetch or FetchMany on the same key still runs one loader per
+// key per process. The result holds every key the loader returned or a
+// joined flight produced, empty values included, so the caller can settle
+// leases; the first loader error, own or joined, is returned with it.
+func (c *Client) runFlights(ctx context.Context, lead []leaseHolder, local []string, load func(context.Context, []string) (map[string][]byte, error)) (map[string][]byte, error) {
+	type joined struct {
+		key    string
+		flight *fetchFlight
+	}
+	own := make([]string, 0, len(lead)+len(local))
+	var joins []joined
+	flights := make(map[string]*fetchFlight)
+	register := func(key string) {
+		if existing := c.fetchFlights[key]; existing != nil {
+			joins = append(joins, joined{key, existing})
+			return
+		}
+		flight := &fetchFlight{done: make(chan struct{})}
+		c.fetchFlights[key] = flight
+		flights[key] = flight
+		own = append(own, key)
+	}
+	c.fetchMu.Lock()
+	for _, holder := range lead {
+		register(holder.key)
+	}
+	for _, key := range local {
+		register(key)
+	}
+	c.fetchMu.Unlock()
+
+	values := make(map[string][]byte, len(own)+len(joins))
+	var firstErr error
+	if len(own) > 0 {
+		loaderCtx, cancel := c.detachedContext(ctx)
+		loaded, err := load(loaderCtx, own)
+		cancel()
+		c.fetchMu.Lock()
+		for key, flight := range flights {
+			flight.value, flight.err = loaded[key], err
+			delete(c.fetchFlights, key)
+		}
+		c.fetchMu.Unlock()
+		for _, flight := range flights {
+			close(flight.done)
+		}
+		firstErr = err
+		for _, key := range own {
+			if value, returned := loaded[key]; returned {
+				values[key] = value
+			}
+		}
+	}
+	for _, j := range joins {
+		select {
+		case <-j.flight.done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if j.flight.err != nil {
+			if firstErr == nil {
+				firstErr = j.flight.err
+			}
+			continue
+		}
+		values[j.key] = j.flight.value
+	}
+	return values, firstErr
+}
+
+// spawnRefreshMany is spawnRefresh for the keys a FetchMany read won refresh
+// leases on: one background loader call recomputes all of them, and each
+// result is written back under its own CAS. Keys already refreshing in this
+// process are left to that refresh.
+func (c *Client) spawnRefreshMany(holders []leaseHolder, ttl Expiration, window time.Duration, loader func(context.Context, []string) (map[string][]byte, error)) {
+	c.fetchMu.Lock()
+	if c.rootCtx.Err() != nil {
+		c.fetchMu.Unlock()
+		return
+	}
+	var mine []leaseHolder
+	for _, holder := range holders {
+		if _, active := c.refreshing[holder.key]; active {
+			continue
+		}
+		c.refreshing[holder.key] = struct{}{}
+		mine = append(mine, holder)
+	}
+	c.fetchMu.Unlock()
+	if len(mine) == 0 {
+		return
+	}
+	go func() {
+		defer func() {
+			c.fetchMu.Lock()
+			for _, holder := range mine {
+				delete(c.refreshing, holder.key)
+			}
+			c.fetchMu.Unlock()
+		}()
+		keys := make([]string, len(mine))
+		for i, holder := range mine {
+			keys[i] = holder.key
+		}
+		refreshCtx, cancel := context.WithTimeout(c.rootCtx, window)
+		defer cancel()
+		values, err := loader(refreshCtx, keys)
+		if err != nil {
+			c.reportError(fmt.Errorf("memcache: fetch background refresh of %d keys: %w", len(keys), err))
+			return
+		}
+		for _, holder := range mine {
+			value := values[holder.key]
+			if len(value) == 0 {
+				c.reportError(fmt.Errorf("memcache: fetch background refresh of %q produced no value, which cannot be cached", holder.key))
+				continue
+			}
+			c.writeBack(holder.key, value, holder.cas, ttl)
+		}
+	}()
+}
+
+// uniqueKeys drops repeated keys while keeping first-occurrence order.
+func uniqueKeys(keys []string) []string {
+	unique := make([]string, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, key)
+	}
+	return unique
 }

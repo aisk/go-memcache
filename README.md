@@ -28,7 +28,7 @@ Every method takes a `context.Context` as its first parameter.
 
 ## Values and keys
 
-The object verbs (`Get`, `GetMany`, `Set`, `SetMany`, `Add`, `Replace`, `Fetch`, `Update`) are generic methods. Their value type `T` is inferred from the argument or callback wherever one exists, and is spelled out only on `Get` and `GetMany`, where the value appears in the return position alone. Values are encoded with the client's `Codec`, `JSONCodec` by default, and `WithCodec` installs another.
+The object verbs (`Get`, `GetMany`, `Set`, `SetMany`, `Add`, `Replace`, `Fetch`, `FetchMany`, `Update`) are generic methods. Their value type `T` is inferred from the argument or callback wherever one exists, and is spelled out only on `Get` and `GetMany`, where the value appears in the return position alone. Values are encoded with the client's `Codec`, `JSONCodec` by default, and `WithCodec` installs another.
 
 ```go
 type Codec interface {
@@ -146,6 +146,21 @@ feed, err := mc.Fetch(ctx, "home:"+uid, 5*time.Minute, buildFeed,
 
 The loader runs on a context owned by the client, not the calling request's context, because its result may be shared by other waiters or outlive the caller entirely. Every caller, the winner included, receives its own decoded copy of the stored form, so what `Fetch` returns is always what a later `Get` would return. Every write back is conditional on the version observed at election, so a key deleted mid recompute is never resurrected. Write back failures never change what `Fetch` returns, they go to the `OnError` hook. `Fetch` never fails because coordination failed. Every path ends in a value, the loader's own error, or the caller's context error.
 
+```go
+func (c *Client) FetchMany[T any](ctx context.Context, keys []string, ttl time.Duration,
+    loader func(ctx context.Context, missing []string) (map[string]T, error), options ...FetchOption) (map[string]T, error)
+```
+
+`FetchMany` is `Fetch` over a set of keys. It reads them all in one round trip per backend, returns the cached values, and hands the rest to `loader` in a single call, storing what comes back for `ttl`. A page that renders dozens of objects therefore pays one read and one origin query when they expire together, and no request recomputes what another is already computing.
+
+```go
+users, err := mc.FetchMany(ctx, userKeys, time.Hour, func(ctx context.Context, missing []string) (map[string]User, error) {
+    return db.LoadUsers(ctx, missing)
+})
+```
+
+Every key is coordinated exactly as `Fetch` coordinates one, key by key: a miss is leased to one caller across processes, other goroutines in the process wait on that caller's result, and a concurrent `Fetch` of a key already being loaded joins it. `RefreshAhead` works the same way, with one background loader call recomputing every key whose lease this read won. A key the loader leaves out is absent from the result, as it would be after a miss at the source, and its lease is released so the next call re-elects. A loader error fails the whole call.
+
 ## Atomic modification
 
 ```go
@@ -201,7 +216,7 @@ mc, err := memcache.NewServers(servers,
 )
 ```
 
-Under `Degrade`, reads report failures as misses, `Fetch` computes locally without writing back, and blind writes (`Set`, `Delete`, `Touch`, `Invalidate`, `Append`, ...) give up silently. Verbs whose answer feeds a business decision (`Add`, `Replace`, `Update`, `Incr`, `Decr`, `Take`) keep failing loudly even under `Degrade`, because inventing an answer is worse than failing. An `AmbiguousWriteError` (the write may have landed) always surfaces. Degrading covers "the cache is down", never "the write may or may not have happened". Every absorbed failure still reaches the `OnError` hook, so degrading business behavior never degrades observability. The client never automatically retries a command after writing begins, since blindly retrying arithmetic or append could apply the mutation twice.
+Under `Degrade`, reads report failures as misses, `Fetch` and `FetchMany` compute locally without writing back, and blind writes (`Set`, `Delete`, `Touch`, `Invalidate`, `Append`, ...) give up silently. Verbs whose answer feeds a business decision (`Add`, `Replace`, `Update`, `Incr`, `Decr`, `Take`) keep failing loudly even under `Degrade`, because inventing an answer is worse than failing. An `AmbiguousWriteError` (the write may have landed) always surfaces. Degrading covers "the cache is down", never "the write may or may not have happened". Every absorbed failure still reaches the `OnError` hook, so degrading business behavior never degrades observability. The client never automatically retries a command after writing begins, since blindly retrying arithmetic or append could apply the mutation twice.
 
 ## Protocol access
 

@@ -28,7 +28,7 @@ defer mc.Close()
 
 ## 值与 key
 
-对象类动词（`Get`、`GetMany`、`Set`、`SetMany`、`Add`、`Replace`、`Fetch`、`Update`）是泛型方法。值类型 `T` 只要出现在实参或回调里就由编译器推导，只有 `Get` 和 `GetMany` 需要写出来，因为值只出现在返回值中。值用客户端的 `Codec` 编解码，默认是 `JSONCodec`，`WithCodec` 可以换成别的。
+对象类动词（`Get`、`GetMany`、`Set`、`SetMany`、`Add`、`Replace`、`Fetch`、`FetchMany`、`Update`）是泛型方法。值类型 `T` 只要出现在实参或回调里就由编译器推导，只有 `Get` 和 `GetMany` 需要写出来，因为值只出现在返回值中。值用客户端的 `Codec` 编解码，默认是 `JSONCodec`，`WithCodec` 可以换成别的。
 
 ```go
 type Codec interface {
@@ -146,6 +146,21 @@ feed, err := mc.Fetch(ctx, "home:"+uid, 5*time.Minute, buildFeed,
 
 loader 运行在客户端持有的 context 上而不是调用请求的 context 上，因为它的结果可能被其他等待者共享，也可能比调用者活得更久。每个调用者（包括赢得选举的那个）拿到的都是存储形态解码出的独立副本，所以 `Fetch` 返回的永远和之后 `Get` 读到的一致。所有写回都以选举时观察到的版本为条件，因此重算过程中被删除的 key 永远不会被复活。写回失败不会改变 `Fetch` 的返回值，它们进入 `OnError` 钩子。`Fetch` 不会因为协调失败而失败，每条路径的终点都是一个值、loader 自己的错误，或调用者的 context 错误。
 
+```go
+func (c *Client) FetchMany[T any](ctx context.Context, keys []string, ttl time.Duration,
+    loader func(ctx context.Context, missing []string) (map[string]T, error), options ...FetchOption) (map[string]T, error)
+```
+
+`FetchMany` 是一组 key 上的 `Fetch`。它对每个后端一次往返读出全部 key，返回缓存中已有的值，其余的 key 一次性交给 `loader`，结果以 `ttl` 存储。一次渲染几十个对象的页面在它们同时过期时只付一次读取和一次回源，也不会有请求重算别人正在算的东西。
+
+```go
+users, err := mc.FetchMany(ctx, userKeys, time.Hour, func(ctx context.Context, missing []string) (map[string]User, error) {
+    return db.LoadUsers(ctx, missing)
+})
+```
+
+每个 key 的协调方式和 `Fetch` 对单个 key 完全一样，逐 key 成立：未命中时跨进程只有一个调用者赢得 lease，同进程的其他 goroutine 等待它的结果，正在被加载的 key 上并发的 `Fetch` 会直接加入。`RefreshAhead` 同样有效，这次读取赢得刷新 lease 的所有 key 由一次后台 loader 调用重算。loader 没有返回的 key 不进结果，就像在数据源未命中一样，它的 lease 会被释放让下一次调用重新选举。loader 出错则整个调用失败。
+
 ## 原子修改
 
 ```go
@@ -201,7 +216,7 @@ mc, err := memcache.NewServers(servers,
 )
 ```
 
-在 `Degrade` 下，读操作把故障报告为未命中，`Fetch` 本地计算但不写回，盲目写入（`Set`、`Delete`、`Touch`、`Invalidate`、`Append` 等）静默放弃。结果用于业务判断的方法（`Add`、`Replace`、`Update`、`Incr`、`Decr`、`Take`）仍然报错，因为编造一个答案比失败更糟。`AmbiguousWriteError`（写入可能已经生效）也总是返回，降级覆盖的是"缓存挂了"，从来不是"写入可能生效也可能没有"。每个被吸收的错误仍然会到达 `OnError` 钩子，业务行为的降级不会降级可观测性。写入开始后客户端永远不会自动重试命令，因为盲目重试算术或追加可能让变更生效两次。
+在 `Degrade` 下，读操作把故障报告为未命中，`Fetch` 和 `FetchMany` 本地计算但不写回，盲目写入（`Set`、`Delete`、`Touch`、`Invalidate`、`Append` 等）静默放弃。结果用于业务判断的方法（`Add`、`Replace`、`Update`、`Incr`、`Decr`、`Take`）仍然报错，因为编造一个答案比失败更糟。`AmbiguousWriteError`（写入可能已经生效）也总是返回，降级覆盖的是"缓存挂了"，从来不是"写入可能生效也可能没有"。每个被吸收的错误仍然会到达 `OnError` 钩子，业务行为的降级不会降级可观测性。写入开始后客户端永远不会自动重试命令，因为盲目重试算术或追加可能让变更生效两次。
 
 ## 协议层
 

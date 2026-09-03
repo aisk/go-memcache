@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -815,4 +816,205 @@ func waitFor(t *testing.T, condition func() bool, message string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal(message)
+}
+
+func TestIntegrationFetchManyMissAndHit(t *testing.T) {
+	c := integrationClient(t)
+	ctx := context.Background()
+	if err := c.Set(ctx, "a", []byte("A"), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var asked [][]string
+	loader := func(_ context.Context, missing []string) (map[string][]byte, error) {
+		sorted := slices.Clone(missing)
+		slices.Sort(sorted)
+		mu.Lock()
+		asked = append(asked, sorted)
+		mu.Unlock()
+		return map[string][]byte{"b": []byte("B"), "unrelated": []byte("ignored")}, nil
+	}
+
+	got, err := c.FetchMany(ctx, []string{"a", "b", "c", "a"}, time.Minute, loader)
+	if err != nil || len(got) != 2 || string(got["a"]) != "A" || string(got["b"]) != "B" {
+		t.Fatalf("first fetch many: %q, %v", got, err)
+	}
+	if len(asked) != 1 || !slices.Equal(asked[0], []string{"b", "c"}) {
+		t.Fatalf("loader was asked %q, want [b c] once", asked)
+	}
+	// b was written back, c's lease was released, so the next call only
+	// computes c and does so immediately rather than waiting out a lease.
+	got, err = c.FetchMany(ctx, []string{"a", "b", "c"}, time.Minute, loader)
+	if err != nil || len(got) != 2 || string(got["b"]) != "B" {
+		t.Fatalf("second fetch many: %q, %v", got, err)
+	}
+	if len(asked) != 2 || !slices.Equal(asked[1], []string{"c"}) {
+		t.Fatalf("loader was asked %q, want [c] on the second call", asked)
+	}
+	if _, ok, err := c.Get[[]byte](ctx, "unrelated"); err != nil || ok {
+		t.Fatalf("a key outside missing was stored: ok=%v err=%v", ok, err)
+	}
+	if got, err := c.FetchMany(ctx, nil, time.Minute, loader); err != nil || len(got) != 0 || len(asked) != 2 {
+		t.Fatalf("empty fetch many: %q, %v, asked %d", got, err, len(asked))
+	}
+}
+
+func TestIntegrationFetchManyMergesConcurrentCallers(t *testing.T) {
+	c := integrationClient(t)
+	ctx := context.Background()
+	var calls atomic.Int32
+	loader := func(_ context.Context, missing []string) (map[string][]byte, error) {
+		calls.Add(1)
+		time.Sleep(50 * time.Millisecond)
+		values := make(map[string][]byte, len(missing))
+		for _, key := range missing {
+			values[key] = []byte(strings.ToUpper(key))
+		}
+		return values, nil
+	}
+	const callers = 8
+	results := make([]map[string][]byte, callers)
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = c.FetchMany(ctx, []string{"x", "y"}, time.Minute, loader)
+		}()
+	}
+	wg.Wait()
+	for i := range callers {
+		if errs[i] != nil || string(results[i]["x"]) != "X" || string(results[i]["y"]) != "Y" {
+			t.Fatalf("caller %d: %q, %v", i, results[i], errs[i])
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("loader ran %d times, want 1", calls.Load())
+	}
+}
+
+func TestIntegrationFetchManyRefreshAhead(t *testing.T) {
+	c := integrationClient(t)
+	ctx := context.Background()
+	if err := c.SetMany(ctx, map[string][]byte{"p": []byte("old p"), "q": []byte("old q")}, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	var mu sync.Mutex
+	var asked []string
+	loader := func(_ context.Context, missing []string) (map[string][]byte, error) {
+		calls.Add(1)
+		mu.Lock()
+		asked = slices.Clone(missing)
+		slices.Sort(asked)
+		mu.Unlock()
+		return map[string][]byte{"p": []byte("new p"), "q": []byte("new q")}, nil
+	}
+	got, err := c.FetchMany(ctx, []string{"p", "q"}, time.Minute, loader, RefreshAhead(30*time.Second))
+	if err != nil || string(got["p"]) != "old p" || string(got["q"]) != "old q" {
+		t.Fatalf("refresh-ahead fetch many: %q, %v", got, err)
+	}
+	waitFor(t, func() bool {
+		values, err := c.GetMany[[]byte](ctx, []string{"p", "q"})
+		return err == nil && string(values["p"]) == "new p" && string(values["q"]) == "new q"
+	}, "background refresh never landed")
+	mu.Lock()
+	defer mu.Unlock()
+	if calls.Load() != 1 || !slices.Equal(asked, []string{"p", "q"}) {
+		t.Fatalf("loader ran %d times with %q, want once with [p q]", calls.Load(), asked)
+	}
+}
+
+func TestIntegrationFetchManyLoaderErrorReleasesLeases(t *testing.T) {
+	c := integrationClient(t)
+	ctx := context.Background()
+	boom := errors.New("upstream down")
+	_, err := c.FetchMany(ctx, []string{"e1", "e2"}, time.Minute, func(context.Context, []string) (map[string][]byte, error) {
+		return nil, boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("loader error was not passed through: %v", err)
+	}
+	// Both leases were released: the next call re-elects at once and its
+	// write-back lands, which a held lease would have prevented.
+	started := time.Now()
+	got, err := c.FetchMany(ctx, []string{"e1", "e2"}, time.Minute, func(_ context.Context, missing []string) (map[string][]byte, error) {
+		return map[string][]byte{"e1": []byte("1"), "e2": []byte("2")}, nil
+	})
+	if err != nil || string(got["e1"]) != "1" || string(got["e2"]) != "2" {
+		t.Fatalf("after failed load: %q, %v", got, err)
+	}
+	if waited := time.Since(started); waited > 500*time.Millisecond {
+		t.Fatalf("second call waited %v on leases that should have been released", waited)
+	}
+	values, err := c.GetMany[[]byte](ctx, []string{"e1", "e2"})
+	if err != nil || len(values) != 2 {
+		t.Fatalf("write-back after re-election: %q, %v", values, err)
+	}
+}
+
+func TestIntegrationFetchJoinsFetchManyFlight(t *testing.T) {
+	c := integrationClient(t)
+	ctx := context.Background()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var manyCalls, singleCalls atomic.Int32
+	go func() {
+		_, _ = c.FetchMany(ctx, []string{"j"}, time.Minute, func(_ context.Context, missing []string) (map[string][]byte, error) {
+			manyCalls.Add(1)
+			close(entered)
+			<-release
+			return map[string][]byte{"j": []byte("J")}, nil
+		})
+	}()
+	<-entered
+	done := make(chan struct{})
+	var got []byte
+	var err error
+	go func() {
+		defer close(done)
+		got, err = c.Fetch(ctx, "j", time.Minute, func(context.Context) ([]byte, error) {
+			singleCalls.Add(1)
+			return []byte("wrong"), nil
+		})
+	}()
+	select {
+	case <-done:
+		t.Fatal("Fetch returned before the FetchMany loader finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	<-done
+	if err != nil || string(got) != "J" {
+		t.Fatalf("fetch joined flight: %q, %v", got, err)
+	}
+	if manyCalls.Load() != 1 || singleCalls.Load() != 0 {
+		t.Fatalf("loaders ran many=%d single=%d, want 1 and 0", manyCalls.Load(), singleCalls.Load())
+	}
+}
+
+func TestIntegrationFetchManyTyped(t *testing.T) {
+	type user struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	c := integrationClient(t)
+	ctx := context.Background()
+	if err := c.Set(ctx, "u:1", user{ID: "1", Name: "cached"}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.FetchMany(ctx, []string{"u:1", "u:2"}, time.Minute, func(_ context.Context, missing []string) (map[string]user, error) {
+		if !slices.Equal(missing, []string{"u:2"}) {
+			t.Errorf("missing = %q", missing)
+		}
+		return map[string]user{"u:2": {ID: "2", Name: "loaded"}}, nil
+	})
+	if err != nil || got["u:1"].Name != "cached" || got["u:2"].Name != "loaded" {
+		t.Fatalf("typed fetch many: %#v, %v", got, err)
+	}
+	stored, ok, err := c.Get[user](ctx, "u:2")
+	if err != nil || !ok || stored.Name != "loaded" {
+		t.Fatalf("stored form: %#v ok=%v err=%v", stored, ok, err)
+	}
 }

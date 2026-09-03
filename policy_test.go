@@ -236,3 +236,52 @@ func TestDegradePolicyAgainstDeadBackend(t *testing.T) {
 		t.Fatal("absorbed failures never reached OnError")
 	}
 }
+
+func TestFetchManyValidatesBeforeDialing(t *testing.T) {
+	var dials atomic.Int32
+	client, err := New("unused", WithDialer(countingDialer(&dials, serveMisses(nil))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	ctx := context.Background()
+	loader := func(_ context.Context, missing []string) (map[string][]byte, error) {
+		return map[string][]byte{}, nil
+	}
+	if _, err := client.FetchMany[[]byte](ctx, []string{"k"}, time.Minute, nil); err == nil || !strings.Contains(err.Error(), "loader") {
+		t.Fatalf("nil loader was accepted: %v", err)
+	}
+	if _, err := client.FetchMany(ctx, []string{"k"}, 10*time.Second, loader, RefreshAhead(30*time.Second)); err == nil || !strings.Contains(err.Error(), "RefreshAhead") {
+		t.Fatalf("oversized refresh window was accepted: %v", err)
+	}
+	if got, err := client.FetchMany(ctx, nil, time.Minute, loader); err != nil || len(got) != 0 {
+		t.Fatalf("empty keys: %v, %v", got, err)
+	}
+	if dials.Load() != 0 {
+		t.Fatalf("dials = %d, want none before a real read", dials.Load())
+	}
+}
+
+func TestFetchManyDegradesToLocalCompute(t *testing.T) {
+	var hooks atomic.Int32
+	client, err := New("127.0.0.1:1",
+		WithDialTimeout(100*time.Millisecond),
+		Degrade(true),
+		OnError(func(error) { hooks.Add(1) }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	var calls atomic.Int32
+	got, err := client.FetchMany(context.Background(), []string{"a", "b"}, time.Minute, func(_ context.Context, missing []string) (map[string][]byte, error) {
+		calls.Add(1)
+		return map[string][]byte{"a": []byte("A"), "b": []byte("B")}, nil
+	})
+	if err != nil || string(got["a"]) != "A" || string(got["b"]) != "B" {
+		t.Fatalf("degraded fetch many: %q, %v", got, err)
+	}
+	if calls.Load() != 1 || hooks.Load() == 0 {
+		t.Fatalf("calls = %d hooks = %d, want one local computation and a reported failure", calls.Load(), hooks.Load())
+	}
+}
