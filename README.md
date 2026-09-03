@@ -190,29 +190,6 @@ buffered, err := mc.Take(ctx, "events:"+uid)   // bytes, split by the caller
 
 A `nil` result from `Take` means there was nothing to take. `Take` is not limited to byte streams, taking a one time token stored with `Set` works the same way.
 
-## Several commands in one round trip
-
-```go
-func (c *Client) Pipeline() *Pipeline
-func (p *Pipeline) Exec(ctx context.Context) error
-```
-
-A request often needs several independent commands before it can proceed: read the user, count the request against a rate limit, renew the session. Issued one after another they cost one round trip each. `Pipeline` queues the same verbs with the same signatures minus the context, each handing back a deferred result, and `Exec` issues them all at once. Concurrent commands to one server share its connection, so they go out together and are answered in one round trip per server.
-
-```go
-p := mc.Pipeline()
-user := p.Get[User]("user:" + uid)
-hits := p.Incr("rate:"+ip, 1, time.Minute)
-p.Touch("session:"+sid, 30*time.Minute)
-if err := p.Exec(ctx); err != nil { /* handle */ }
-if hits.Value > 100 { /* reject the request */ }
-render(user.Value)
-```
-
-Deferred results mirror each verb's return values. `Get` and `Inspect` hand back a `*Lookup[T]` with `Value`, `OK` and `Err`. Verbs that answer with a value and an error, such as `Fetch`, `Incr` and `Add`, hand back a `*Result[T]` with `Value` and `Err`. Verbs that answer only with an error hand back an `*Outcome`. `Exec` fills the fields in, and before it they read as zero.
-
-A pipeline changes only when commands go out. Each verb keeps its own semantics, including how it behaves under `Degrade`, and `Fetch` and `Update` take part like any other verb with their extra round trips overlapping the rest. `Exec` returns the first error in queue order and every deferred result also carries its own, so one failing command does not hide the others' answers. A `Pipeline` is not safe for concurrent use and can be reused after `Exec`.
-
 ## Failure policy
 
 By default every infrastructure failure surfaces as an error. The `Degrade(true)` client option decouples a cache outage from a site outage.

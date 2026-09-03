@@ -190,29 +190,6 @@ buffered, err := mc.Take(ctx, "events:"+uid)   // 字节流，由调用方切分
 
 `Take` 返回 `nil` 表示没有东西可取。`Take` 不限于字节流，取走一个用 `Set` 存储的一次性令牌也是同样的用法。
 
-## 一轮往返里的多个命令
-
-```go
-func (c *Client) Pipeline() *Pipeline
-func (p *Pipeline) Exec(ctx context.Context) error
-```
-
-一个请求往往要先做几件互不依赖的事才能继续：读用户资料、给限流计数加一、续期会话。逐个调用就要付几轮往返。`Pipeline` 用同样的动词、同样的签名（去掉 context）把它们攒起来，每个动词交回一个延迟结果，`Exec` 一次性发出。发往同一台服务器的并发命令共享连接，所以它们一起出去，每台服务器一轮往返收齐。
-
-```go
-p := mc.Pipeline()
-user := p.Get[User]("user:" + uid)
-hits := p.Incr("rate:"+ip, 1, time.Minute)
-p.Touch("session:"+sid, 30*time.Minute)
-if err := p.Exec(ctx); err != nil { /* 处理 */ }
-if hits.Value > 100 { /* 拒绝请求 */ }
-render(user.Value)
-```
-
-延迟结果和动词的返回值一一对应。`Get` 和 `Inspect` 交回 `*Lookup[T]`，字段是 `Value`、`OK` 和 `Err`。返回值加错误的动词，比如 `Fetch`、`Incr`、`Add`，交回 `*Result[T]`，字段是 `Value` 和 `Err`。只返回错误的动词交回 `*Outcome`。字段由 `Exec` 填入，在此之前读到的是零值。
-
-Pipeline 只改变命令何时发出。每个动词保持自己的语义，包括 `Degrade` 下的行为，`Fetch` 和 `Update` 也和其他动词一样可以放进来，它们的额外往返和其余命令重叠进行。`Exec` 返回队列顺序里的第一个错误，每个延迟结果也带着自己的错误，所以一个命令失败不会掩盖其他命令的答案。`Pipeline` 不能并发使用，`Exec` 之后可以复用。
-
 ## 故障策略
 
 默认情况下每个基础设施故障都以错误形式返回。客户端选项 `Degrade(true)` 把缓存故障和整站故障解耦。
