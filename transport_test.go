@@ -711,3 +711,101 @@ func TestIdleTimeoutRedials(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	get(2) // idle connection expired
 }
+
+func TestWithNetworkReachesDialer(t *testing.T) {
+	var seen atomic.Value
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		seen.Store(network + " " + address)
+		client, server := net.Pipe()
+		go serveMisses(nil)(server)
+		return client, nil
+	}
+	client, err := New("/run/memcached.sock", WithNetwork("unix"), WithDialer(dial))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, _, err := client.Get[[]byte](context.Background(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Load(); got != "unix /run/memcached.sock" {
+		t.Fatalf("dialer saw %q", got)
+	}
+}
+
+func TestMaxItemSizeLimitsBothDirections(t *testing.T) {
+	if _, err := New("unused", WithMaxItemSize(-1)); err == nil {
+		t.Fatal("negative limit was accepted")
+	}
+	var dials atomic.Int32
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			reader := bufio.NewReader(server)
+			_, _ = reader.ReadString('\n')
+			_, _ = server.Write([]byte("VA 8 c1\r\noversize\r\n"))
+		}()
+		return client, nil
+	}
+	client, err := New("pipe", WithMaxItemSize(4), WithDialer(dial))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx := context.Background()
+
+	var usage *usageError
+	if err := client.Set(ctx, "k", []byte("12345"), Forever); !errors.As(err, &usage) || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("oversized set: %T %v", err, err)
+	}
+	_, err = client.Meta().Batch(ctx, []Operation{SetOperation{Key: "k", Value: []byte("12345")}})
+	if err == nil || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("oversized batch set: %v", err)
+	}
+	if dials.Load() != 0 {
+		t.Fatal("an oversized value reached the network")
+	}
+	var protocol *ProtocolError
+	if _, _, err := client.Get[[]byte](ctx, "k"); !errors.As(err, &protocol) || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("oversized response: %T %v", err, err)
+	}
+}
+
+func TestArithmeticStatusMapping(t *testing.T) {
+	replies := []string{"EX\r\n", "NF\r\n", "ZZ\r\n"}
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			reader := bufio.NewReader(server)
+			for _, reply := range replies {
+				if _, err := reader.ReadString('\n'); err != nil {
+					return
+				}
+				_, _ = server.Write([]byte(reply))
+			}
+		}()
+		return client, nil
+	}
+	client, err := New("pipe", WithDialer(dial))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx := context.Background()
+	cas := uint64(7)
+	result, err := client.Meta().Arithmetic(ctx, "n", MetaArithmeticOptions{Delta: 1, CompareCAS: &cas})
+	if err != nil || result.Status != MutationCASMismatch {
+		t.Fatalf("EX: %#v, %v", result, err)
+	}
+	result, err = client.Meta().Arithmetic(ctx, "n", MetaArithmeticOptions{Delta: 1})
+	if err != nil || result.Status != MutationNotFound {
+		t.Fatalf("NF: %#v, %v", result, err)
+	}
+	var protocol *ProtocolError
+	if _, err = client.Meta().Arithmetic(ctx, "n", MetaArithmeticOptions{Delta: 1}); !errors.As(err, &protocol) {
+		t.Fatalf("unknown code: %T %v", err, err)
+	}
+}

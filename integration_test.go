@@ -1018,3 +1018,23 @@ func TestIntegrationFetchManyTyped(t *testing.T) {
 		t.Fatalf("stored form: %#v ok=%v err=%v", stored, ok, err)
 	}
 }
+
+func TestIntegrationBatchArithmetic(t *testing.T) {
+	c := integrationClient(t)
+	ctx := context.Background()
+	initial, ttl := uint64(5), Expiration(60)
+	results, err := c.Meta().Batch(ctx, []Operation{
+		ArithmeticOperation{Key: "n", Options: MetaArithmeticOptions{Delta: 1, Initial: &initial, InitialTTL: &ttl}},
+		ArithmeticOperation{Key: "n", Options: MetaArithmeticOptions{Delta: 3}},
+		ArithmeticOperation{Key: "absent", Options: MetaArithmeticOptions{Delta: 1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results[0].Err != nil || results[0].Arithmetic.Value != 5 || results[1].Err != nil || results[1].Arithmetic.Value != 8 {
+		t.Fatalf("batch arithmetic: %#v", results[:2])
+	}
+	if results[2].Err != nil || results[2].Arithmetic.Status != MutationNotFound {
+		t.Fatalf("arithmetic on a missing key: %#v", results[2])
+	}
+}

@@ -20,7 +20,7 @@ if err != nil { /* handle */ }
 defer mc.Close()
 ```
 
-多服务器时，key 通过稳定的 rendezvous 哈希分布，`WithRouter` 可以替换路由策略。每个服务器一条多路复用连接。并发发出的命令在这条连接上排队，一次 flush 写出，按顺序收到应答，所以 N 个 goroutine 同时访问一台服务器只付一轮往返、只占一个 socket。`WithMaxConns` 允许每台服务器开更多连接，只有当现有连接全都有命令在途时才会再拨一条。没有命令在途的连接空闲超过 `WithIdleTimeout`（默认 90 秒）后关闭，下次需要时重新拨号。
+多服务器时，key 通过稳定的 rendezvous 哈希分布，`WithRouter` 可以替换路由策略。每个服务器一条多路复用连接。并发发出的命令在这条连接上排队并管线化写出，写侧忙碌期间攒下的命令在下一次 flush 一起出去，应答按顺序收回，所以 N 个 goroutine 同时访问一台服务器只占一个 socket，延迟接近一轮往返而不是 N 轮。`WithMaxConns` 允许每台服务器开更多连接，只有当现有连接全都有命令在途时才会再拨一条。没有命令在途的连接空闲超过 `WithIdleTimeout`（默认 90 秒）后关闭，下次需要时重新拨号。
 
 其他选项有 `WithTimeout`（单次请求）、`WithDialTimeout`、`WithNetwork`、`WithDialer`、`WithMaxItemSize`，以及下文介绍的策略选项 `WithCodec`、`Degrade`、`OnError` 和客户端级的 `RefreshAhead` 默认值。
 
